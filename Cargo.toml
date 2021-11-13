@@ -7,3 +7,5 @@ edition = "2021"
 
 [dependencies]
 sfml = "0.16.0"
+gl = "0.14.0"
+gl_loader = "0.1.2"
