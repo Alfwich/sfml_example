@@ -1,9 +1,13 @@
 #version 330 core
 
-in vec4 gl_FragCoord;
+in vec3 color;
+in vec2 uv;
+
 out vec4 FragColor;
+
+uniform sampler2D tex1;
 
 void main()
 {
-    FragColor = vec4(cos(gl_FragCoord.x), sin(gl_FragCoord.x), cos(gl_FragCoord.x) + sin(gl_FragCoord.y), 1.0f);
+    FragColor = texture(tex1, uv) * vec4(color.xyz, 1.0);
 } 

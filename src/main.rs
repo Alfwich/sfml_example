@@ -10,9 +10,15 @@ fn load_image() -> u32 {
         gl::GenTextures(1, &mut id);
         if id != 0 {
             gl::BindTexture(gl::TEXTURE_2D, id);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::REPEAT.try_into().unwrap());
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::REPEAT.try_into().unwrap());
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR.try_into().unwrap());
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR.try_into().unwrap());
             let img_data = Image::from_file("scale.jpg").unwrap();
             let img_data_ptr = img_data.pixel_data().as_ptr() as *const c_void;
-            gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RGB.try_into().unwrap(), 100, 100, 0, gl::RGB, gl::UNSIGNED_BYTE, img_data_ptr);
+            // RGBA since pixel_data pads to 4 channels
+            gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA.try_into().unwrap(), 500, 281, 0, gl::RGBA, gl::UNSIGNED_BYTE, img_data_ptr);
+            gl::GenerateMipmap(gl::TEXTURE_2D);
             gl::BindTexture(gl::TEXTURE_2D, 0);
         }
         id
@@ -111,17 +117,32 @@ fn create_and_link_program(vertex_shader_source: &str, fragment_shader_source: &
     }
 }
 
-fn upload_buffer_data(vao: u32, vbo: u32, ibo: u32) {
-    let vertex_data = [
-        -1.0f32, 1.,
-        0., 1.,
-        0., 0.,
-        -1., 0.
+fn f32_size_mult(len: usize) -> isize {
+    static F32_SIZE: usize = std::mem::size_of::<f32>();
+    (F32_SIZE * len).try_into().unwrap()
+}
+
+struct Vertex {
+    pos: [f32; 3],
+    color: [f32; 3],
+    uv: [f32; 2]
+}
+
+fn upload_buffer_data(vao: u32, vbo: u32, ebo: u32) {
+    let vertex_data: [Vertex; 4] = [
+        Vertex { pos: [0.5,   0.5, 0.], color: [1., 0., 1.], uv: [1., 0.] },
+        Vertex { pos: [0.5,  -0.5, 0.], color: [1., 0., 1.], uv: [1., 1.] },
+        Vertex { pos: [-0.5, -0.5, 0.], color: [0., 1., 1.], uv: [0., 1.] },
+        Vertex { pos: [-0.5,  0.5, 0.], color: [0., 1., 1.], uv: [0., 0.] }
     ];
+    let size_of_vertex = std::mem::size_of_val(&vertex_data[0]).try_into().unwrap();
+    let size_of_vertex_pos = std::mem::size_of_val(&vertex_data[0].pos);
+    let size_of_vertex_color = std::mem::size_of_val(&vertex_data[0].color);
+    let _size_of_vertex_uv = std::mem::size_of_val(&vertex_data[0].uv);
     
     let index_data = [
-        0, 1, 2,
-        0, 2, 3
+        0, 1, 3,
+        1, 2, 3
     ];
     
     // Bind VAO
@@ -132,14 +153,18 @@ fn upload_buffer_data(vao: u32, vbo: u32, ibo: u32) {
     // Load VBO
     unsafe {
         gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-        gl::BufferData(gl::ARRAY_BUFFER, (std::mem::size_of::<f32>() * vertex_data.len()).try_into().unwrap(), vertex_data.as_ptr() as *const c_void, gl::STATIC_DRAW);
+        gl::BufferData(gl::ARRAY_BUFFER, f32_size_mult(size_of_vertex as usize * vertex_data.len()), vertex_data.as_ptr() as *const c_void, gl::STATIC_DRAW);
+        gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, size_of_vertex, 0 as *const c_void);
         gl::EnableVertexAttribArray(0);
-        gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 0, 0 as *const c_void);
+        gl::VertexAttribPointer(1, 3, gl::FLOAT, gl::FALSE, size_of_vertex, size_of_vertex_pos as *const c_void);
+        gl::EnableVertexAttribArray(1);
+        gl::VertexAttribPointer(2, 2, gl::FLOAT, gl::FALSE, size_of_vertex, (size_of_vertex_pos + size_of_vertex_color) as *const c_void);
+        gl::EnableVertexAttribArray(2);
     }
     
-    // Load IBO
+    // Load EBO
     unsafe {
-        gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ibo);
+        gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
         gl::BufferData(gl::ELEMENT_ARRAY_BUFFER, (std::mem::size_of::<i32>() * index_data.len()).try_into().unwrap(), index_data.as_ptr() as *const c_void, gl::STATIC_DRAW);
     }
 }
@@ -156,11 +181,11 @@ fn main() {
     
     let vao = gen_vertex_buffer();
     let vbo = gen_buffer();
-    let ibo = gen_buffer();
+    let ebo = gen_buffer();
     let default_program = create_default_program();
     let texture_id = load_image();
     
-    upload_buffer_data(vao, vbo, ibo);
+    upload_buffer_data(vao, vbo, ebo);
     
     while window.is_open() {
         while let Some(event) = window.poll_event() {
@@ -174,19 +199,18 @@ fn main() {
         unsafe {
             gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
             gl::Viewport(0, 0, 800, 600);
+            gl::BindVertexArray(vao);
             gl::BindTexture(gl::TEXTURE_2D, texture_id);
-            gl::BindVertexArray(vbo);
-            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ibo);
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
             gl::UseProgram(default_program);
             gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
-            gl::BindTexture(gl::TEXTURE_2D, 0);
         }
         
         window.display();
     }
     
     unsafe {
-        gl::DeleteBuffers(1, &ibo);
+        gl::DeleteBuffers(1, &ebo);
         gl::DeleteBuffers(1, &vbo);
         gl::DeleteVertexArrays(1, &vao);
         gl::DeleteProgram(default_program);
