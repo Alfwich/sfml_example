@@ -4,6 +4,8 @@ use sfml::window::{Window, Event, Style};
 use sfml::graphics::{Image};
 use core::ffi::c_void;
 
+extern crate nalgebra_glm as glm;
+
 fn load_image() -> u32 {
     unsafe {
         let mut id : u32 = 0;
@@ -169,6 +171,10 @@ fn upload_buffer_data(vao: u32, vbo: u32, ebo: u32) {
     }
 }
 
+fn deg_to_rad(x:f32) -> f32 {
+    x * (3.141592/180.0)
+}
+
 fn main() {
     
     // Creates GL context internally
@@ -197,6 +203,17 @@ fn main() {
         window.set_active(true);
         
         unsafe {
+            let ortho = glm::ortho(0.0f32, 800., 0., 600., -10., 100.);
+            let id = glm::identity::<f32, 4>();
+            let scale = glm::make_vec3(&[500., 281., 1.0]);
+            let model = glm::scale(&id, &scale);
+            let mve = glm::make_vec3(&[400., 300., 0.0]);
+            let view = glm::translate(&id, &mve);
+            let mvp = ortho * view * model;
+            let mvp_name = "mvp\0".as_bytes();
+            let mvp_loc = gl::GetUniformLocation(default_program, mvp_name.as_ptr() as *const i8);
+            
+            gl::UniformMatrix4fv(mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
             gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
             gl::Viewport(0, 0, 800, 600);
             gl::BindVertexArray(vao);
