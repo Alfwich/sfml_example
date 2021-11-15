@@ -27,10 +27,6 @@ struct DImage {
     pos: [i32; 2]
 }
 
-lazy_static::lazy_static! {
-    static ref next_item: Mutex<i32> = Mutex::new(0i32);
-}
-
 fn load_image_from_url(client: &reqwest::blocking::Client, url: &str) -> Result<u32, String> {
     println!("Getting image data for: {:?}", url);
     let resp = client.get(url).send().unwrap().bytes().unwrap();
@@ -205,12 +201,20 @@ fn upload_buffer_data(vao: u32, vbo: u32, ebo: u32) {
 static WINDOW_SIZE: (u32, u32) = (1920, 1080);
 static APP_FPS: u32 = 60;
 static APP_DATA_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/home.json";
-static mut next_idx: usize = 0;
 
+static mut next_idx: usize = 0;
 static mut images : Vec<DImage> = Vec::new();
 
+lazy_static::lazy_static! {
+    static ref next_item: Mutex<i32> = Mutex::new(0i32);
+}
+
+
 fn load_all_images() {
+    
     unsafe {
+        next_idx = 0;
+        
         let resp = reqwest::blocking::get(APP_DATA_SOURCE).unwrap().text().unwrap();
         let data: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let containers: Vec<serde_json::Value> = data["data"]["StandardCollection"]["containers"].as_array().unwrap().to_vec();
@@ -243,7 +247,7 @@ fn load_all_images() {
         }
         
         // Spawn threads to acquire images
-        for idx in 0..16 {
+        for idx in 0..8 {
             thread::spawn(|| {
                 let client = reqwest::blocking::Client::new();
                 let context = Context::new();
