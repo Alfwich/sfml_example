@@ -867,6 +867,7 @@ version = "0.1.0"
 dependencies = [
  "gl",
  "gl_loader",
+ "lazy_static",
  "nalgebra-glm",
  "reqwest",
  "serde",

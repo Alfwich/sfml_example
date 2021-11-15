@@ -1,9 +1,11 @@
 use std::fs::File;
 use std::io::Read;
-use sfml::window::{Window, Event, Style, Key};
+use sfml::window::{Window, Context, Event, Style, Key};
 use sfml::graphics::{Image};
 use core::ffi::c_void;
 use core::result::Result;
+use std::thread;
+use std::sync::{Mutex};
 
 extern crate nalgebra_glm as glm;
 
@@ -20,21 +22,26 @@ struct Viewport {
 
 #[derive(Debug)]
 struct DImage {
-    texture_id: u32,
+    pub texture_id: u32,
+    texture_url: String,
     pos: [i32; 2]
 }
 
-fn load_image_from_url(url: &str) -> Result<u32, String> {
+lazy_static::lazy_static! {
+    static ref next_item: Mutex<i32> = Mutex::new(0i32);
+}
+
+fn load_image_from_url(client: &reqwest::blocking::Client, url: &str) -> Result<u32, String> {
     println!("Getting image data for: {:?}", url);
-    let resp = reqwest::blocking::get(url).unwrap().bytes().unwrap();
+    let resp = client.get(url).send().unwrap().bytes().unwrap();
     
     unsafe {
         let mut id : u32 = 0;
         gl::GenTextures(1, &mut id);
         if id != 0 {
             gl::BindTexture(gl::TEXTURE_2D, id);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::REPEAT.try_into().unwrap());
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::REPEAT.try_into().unwrap());
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE.try_into().unwrap());
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE.try_into().unwrap());
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR.try_into().unwrap());
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR.try_into().unwrap());
             let img_data = Image::from_memory(&resp);
@@ -198,41 +205,69 @@ fn upload_buffer_data(vao: u32, vbo: u32, ebo: u32) {
 static WINDOW_SIZE: (u32, u32) = (1920, 1080);
 static APP_FPS: u32 = 60;
 static APP_DATA_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/home.json";
+static mut next_idx: usize = 0;
 
-fn load_all_images(images: &mut Vec<DImage>) {
-    let resp = reqwest::blocking::get(APP_DATA_SOURCE).unwrap().text().unwrap();
-    let data: serde_json::Value = serde_json::from_str(&resp).unwrap();
-    let containers: Vec<serde_json::Value> = data["data"]["StandardCollection"]["containers"].as_array().unwrap().to_vec();
-    let mut pos: (i32, i32) = (0, 0);
-    for container in containers {
-        let items = container["set"]["items"].as_array();
-        match items {
-            Some(arr) => {
-                for item in arr.to_vec() {
-                    let mut url:String = "".to_string();
-                    if item["image"]["tile"]["1.78"]["series"]["default"]["url"].is_string() {
-                        url = item["image"]["tile"]["1.78"]["series"]["default"]["url"].to_string();
-                    } else if item["image"]["tile"]["1.78"]["program"]["default"]["url"].is_string() {
-                        url = item["image"]["tile"]["1.78"]["program"]["default"]["url"].to_string();
-                    } else if item["image"]["tile"]["1.78"]["default"]["default"]["url"].is_string() {
-                        url = item["image"]["tile"]["1.78"]["default"]["default"]["url"].to_string();
-                    } else {
-                        println!("Failed to fish out image url: {:#?}", item["image"]["tile"]["1.78"]);
+static mut images : Vec<DImage> = Vec::new();
+
+fn load_all_images() {
+    unsafe {
+        let resp = reqwest::blocking::get(APP_DATA_SOURCE).unwrap().text().unwrap();
+        let data: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let containers: Vec<serde_json::Value> = data["data"]["StandardCollection"]["containers"].as_array().unwrap().to_vec();
+        let mut pos: (i32, i32) = (0, 0);
+        for container in containers {
+            let items = container["set"]["items"].as_array();
+            match items {
+                Some(arr) => {
+                    for item in arr.to_vec() {
+                        let mut url:String = "".to_string();
+                        if item["image"]["tile"]["1.78"]["series"]["default"]["url"].is_string() {
+                            url = item["image"]["tile"]["1.78"]["series"]["default"]["url"].to_string();
+                        } else if item["image"]["tile"]["1.78"]["program"]["default"]["url"].is_string() {
+                            url = item["image"]["tile"]["1.78"]["program"]["default"]["url"].to_string();
+                        } else if item["image"]["tile"]["1.78"]["default"]["default"]["url"].is_string() {
+                            url = item["image"]["tile"]["1.78"]["default"]["default"]["url"].to_string();
+                        } else {
+                            println!("Failed to fish out image url: {:#?}", item["image"]["tile"]["1.78"]);
+                        }
+                        url = url[1..url.len()-1].to_string();
+                        
+                        images.push( DImage { texture_url: url.to_string(), texture_id: 0, pos: [pos.0, pos.1]} );
+                        pos.0 += 1;
                     }
-                    url = url[1..url.len()-1].to_string();
-                    match load_image_from_url(&url) {
+                },
+                _ => {}
+            }
+            pos.1 += 1;
+            pos.0 = 0;
+        }
+        
+        // Spawn threads to acquire images
+        for idx in 0..16 {
+            thread::spawn(|| {
+                let client = reqwest::blocking::Client::new();
+                let context = Context::new();
+                loop {
+                    let next;
+                    {
+                        next_item.lock();
+                        next = next_idx;
+                        next_idx += 1;
+                    }
+                    
+                    if next >= images.len() {
+                        break;
+                    }
+                    
+                    match load_image_from_url(&client, &images[next].texture_url) {
                         Ok(texture_id) => {
-                            images.push( DImage { texture_id: texture_id, pos: [pos.0, pos.1]} );
-                            pos.1 += 1;
+                            images[next].texture_id = texture_id;
                         },
                         _ => {}
-                    }
+                    }        
                 }
-            },
-            _ => {}
+            });
         }
-        pos.0 += 1;
-        pos.1 = 0;
     }
 }
 
@@ -246,14 +281,12 @@ fn main() {
     gl_loader::init_gl();
     gl::load_with(|s| gl_loader::get_proc_address(s) as *const _);
     
-    let mut images : Vec<DImage> = Vec::new();
-    load_all_images(&mut images);
+    load_all_images();
     
     let vao = gen_vertex_buffer();
     let vbo = gen_buffer();
     let ebo = gen_buffer();
     let default_program = create_default_program();
-    //let texture_id = load_image();
     
     upload_buffer_data(vao, vbo, ebo);
     
@@ -276,16 +309,16 @@ fn main() {
                 Event::KeyPressed { code, .. } => {
                     match code {
                         Key::A => {
-                            viewport.pos[0] -= 100.;
-                        },
-                        Key::D => {
                             viewport.pos[0] += 100.;
                         },
+                        Key::D => {
+                            viewport.pos[0] -= 100.;
+                        },
                         Key::W => {
-                            viewport.pos[1] += 100.;
+                            viewport.pos[1] -= 100.;
                         },
                         Key::S => {
-                            viewport.pos[1] -= 100.;
+                            viewport.pos[1] += 100.;
                         },
                         _ => {}
                     }
@@ -326,7 +359,7 @@ fn main() {
         gl::DeleteBuffers(1, &vbo);
         gl::DeleteVertexArrays(1, &vao);
         gl::DeleteProgram(default_program);
-        for image in images {
+        for image in &images {
             gl::DeleteTextures(1, &image.texture_id);
         }
     }
