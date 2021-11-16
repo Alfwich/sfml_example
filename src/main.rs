@@ -220,10 +220,6 @@ fn upload_buffer_data(vao: u32, vbo: u32, ebo: u32) {
     }
 }
 
-static WINDOW_SIZE: (u32, u32) = (1920, 1080);
-static APP_FPS: u32 = 60;
-static mut CONTAINERS: Vec<DImageRow> = Vec::new();
-
 fn get_item_image_url_from_json_value(item: &serde_json::Value) -> String {
     let mut url:String = "".to_string();
     if item["image"]["tile"]["1.78"]["series"]["default"]["url"].is_string() {
@@ -267,7 +263,6 @@ fn get_container_refset_type_from_json_value(container: &serde_json::Value) -> S
 }
 
 fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), top: i32, dst: &mut [[u8; 1024]; 256], src: &[u8]) {
-    //println!("top: {:?}", top);
     let y_offset = 128 - top as u32;
     for x in 0..size.0 {
         for y in y_offset..(size.1 + y_offset) {
@@ -307,6 +302,7 @@ fn render_text_to_texture(str: &str) -> RenderedImage {
         gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR.try_into().unwrap());
         gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR.try_into().unwrap());
         gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+        
         let texture_data = sw_render_text_to_buffer(str);
         let texture_data_ptr = texture_data.0.as_ptr() as *const c_void;
         
@@ -322,8 +318,12 @@ fn render_text_to_texture(str: &str) -> RenderedImage {
     }
 }
 
-fn load_all_images() {
+// Loads initial page data and kicks off worker threads to finish image loading and refset loading
+fn load_page_data() {
+    static NUM_THREADS: i32 = 8;
     static APP_DATA_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/home.json";
+    static APP_DATA_REFSET_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/sets/{{id}}.json";
+    
     unsafe {
         let resp = reqwest::blocking::get(APP_DATA_SOURCE).unwrap().text().unwrap();
         let data: serde_json::Value = serde_json::from_str(&resp).unwrap();
@@ -346,17 +346,13 @@ fn load_all_images() {
             }
         }
         
-        
         lazy_static::lazy_static! {
             static ref NEXT_IDS_LOCK: Mutex<i32> = Mutex::new(0i32);
         }
-    
-        static APP_DATA_REFSET_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/sets/{{id}}.json";
         static mut NEXT_IDX: usize = 0;
         
-        NEXT_IDX = 0;
         // Spawn threads to acquire images and populate refsets
-        for _thread_idx in 0..8 {
+        for _thread_idx in 0..NUM_THREADS {
             thread::spawn(|| {
                 let client = reqwest::blocking::Client::new();
                 // Create GL context to allow async threads to load image data
@@ -419,7 +415,11 @@ fn load_all_images() {
     }
 }
 
+static mut CONTAINERS: Vec<DImageRow> = Vec::new();
+
 fn main() {
+    static WINDOW_SIZE: (u32, u32) = (1920, 1080);
+    static APP_FPS: u32 = 60;
     
     // Creates GL context internally
     let mut window = Window::new(WINDOW_SIZE, "SFML Example", Style::CLOSE, &Default::default());
@@ -429,7 +429,7 @@ fn main() {
     gl_loader::init_gl();
     gl::load_with(|s| gl_loader::get_proc_address(s) as *const _);
     
-    load_all_images();
+    load_page_data();
     
     let vao = gen_vertex_buffer();
     let vbo = gen_buffer();
@@ -441,13 +441,16 @@ fn main() {
     
     let ortho = glm::ortho(0.0f32, WINDOW_SIZE.0 as f32, 0., WINDOW_SIZE.1 as f32, -10., 100.);
     let id = glm::identity::<f32, 4>();
-    let base_move = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2., WINDOW_SIZE.1 as f32 / 2., 0.0]);
+    let base_move = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2. - 700., WINDOW_SIZE.1 as f32 / 2. + 500., 0.0]);
     
     let mvp_name = "mvp\0".as_bytes();
     let default_mvp_loc; 
-    unsafe { default_mvp_loc = gl::GetUniformLocation(default_program, mvp_name.as_ptr() as *const i8); };
     let text_mvp_loc; 
-    unsafe { text_mvp_loc = gl::GetUniformLocation(text_program, mvp_name.as_ptr() as *const i8); };
+    
+    unsafe { 
+        default_mvp_loc = gl::GetUniformLocation(default_program, mvp_name.as_ptr() as *const i8);
+        text_mvp_loc = gl::GetUniformLocation(text_program, mvp_name.as_ptr() as *const i8); 
+    }
     
     let mut viewport = Viewport { pos: [0., 0.] };
     let mut selected_container_idx = 0;
@@ -493,8 +496,7 @@ fn main() {
             }
         }
         
-        viewport.pos[0] = -700.;
-        viewport.pos[1] = 500. + (390 * selected_container_idx) as f32;
+        viewport.pos[1] = (390 * selected_container_idx) as f32;
         
         window.set_active(true);
         
@@ -502,6 +504,10 @@ fn main() {
             gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
             gl::Enable(gl::BLEND); 
             gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+            gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
+            gl::BindVertexArray(vao);
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
+            
             let mut idx = (0, 0);
             for container_idx in 0..CONTAINERS.len() {
                 if CONTAINERS[container_idx].loaded_failed {
@@ -517,10 +523,7 @@ fn main() {
                     
                     gl::UseProgram(text_program);
                     gl::UniformMatrix4fv(text_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                    gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
-                    gl::BindVertexArray(vao);
                     gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].title.texture_id);
-                    gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
                     gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
                     
                     idx.1 += 160;
@@ -540,10 +543,7 @@ fn main() {
                         
                         gl::UseProgram(default_program);
                         gl::UniformMatrix4fv(default_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                        gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
-                        gl::BindVertexArray(vao);
                         gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].images[image_idx].texture_id);
-                        gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
                         gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
                         idx.0 += 525;
                     }
