@@ -356,7 +356,7 @@ fn load_all_images() {
         
         NEXT_IDX = 0;
         // Spawn threads to acquire images and populate refsets
-        for _thread_idx in 0..1 {
+        for _thread_idx in 0..8 {
             thread::spawn(|| {
                 let client = reqwest::blocking::Client::new();
                 // Create GL context to allow async threads to load image data
