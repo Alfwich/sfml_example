@@ -32,7 +32,7 @@ struct DImage {
 struct DImageRow {
     pub loaded_failed: bool,
     pub title: String,
-    //pub title_render_texture: RenderTexture,
+    
     pub images: Vec<DImage>,
     pub offset: (f32, f32),
     
@@ -137,6 +137,10 @@ fn create_shader(shader_type: u32, shader_source_location: &str) -> Result<u32, 
 
 fn create_default_program() -> u32{
     create_and_link_program("vertex.glsl", "fragment.glsl")
+}
+
+fn create_text_program() -> u32{
+    create_and_link_program("vertex.glsl", "text.glsl")
 }
 
 fn create_and_link_program(vertex_shader_source: &str, fragment_shader_source: &str) -> u32 {
@@ -273,7 +277,7 @@ fn sw_render_text_to_buffer(str: &str) -> ([[u8; 1024]; 256], u32){
     static FONT_FILE: &str = "GlacialIndifference-Bold.otf";
     let lib = freetype::Library::init().unwrap();
     let face = lib.new_face(FONT_FILE, 0).unwrap();
-    face.set_char_size(40 * 128, 0, 100, 0).map_err(|err| println!("{:?}", err)).ok();
+    face.set_char_size(40 * 32, 0, 100, 0).map_err(|err| println!("{:?}", err)).ok();
     let mut offset = (0u32, 0u32);
     for c in str.chars() {
         face.load_char(c as usize, freetype::face::LoadFlag::RENDER).map_err(|err| println!("{:?}", err)).ok();
@@ -421,7 +425,8 @@ fn main() {
     let vbo = gen_buffer();
     let ebo = gen_buffer();
     let default_program = create_default_program();
-    let text_texture_id = render_text_to_texture("Hello World!\n");
+    let text_program = create_text_program();
+    let text_texture_id = render_text_to_texture("The quick        brown fox jumps over the lazy dog");
     
     upload_buffer_data(vao, vbo, ebo);
     
@@ -430,8 +435,10 @@ fn main() {
     let base_move = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2., WINDOW_SIZE.1 as f32 / 2., 0.0]);
     
     let mvp_name = "mvp\0".as_bytes();
-    let mvp_loc; 
-    unsafe { mvp_loc = gl::GetUniformLocation(default_program, mvp_name.as_ptr() as *const i8); };
+    let default_mvp_loc; 
+    unsafe { default_mvp_loc = gl::GetUniformLocation(default_program, mvp_name.as_ptr() as *const i8); };
+    let text_mvp_loc; 
+    unsafe { text_mvp_loc = gl::GetUniformLocation(text_program, mvp_name.as_ptr() as *const i8); };
     
     let mut viewport = Viewport { pos: [0., 0.] };
     
@@ -468,7 +475,8 @@ fn main() {
         
         unsafe {
             gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
-            
+            gl::Enable(gl::BLEND); 
+            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
             let mut idx = (0, 0);
             for container_idx in 0..CONTAINERS.len() {
                 if CONTAINERS[container_idx].loaded_failed {
@@ -486,12 +494,12 @@ fn main() {
                     let view = glm::translate(&id, &mve);
                     let mvp = ortho * view * model;
                     
-                    gl::UniformMatrix4fv(mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                    gl::UseProgram(default_program);
+                    gl::UniformMatrix4fv(default_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
                     gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
                     gl::BindVertexArray(vao);
                     gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].images[image_idx].texture_id);
                     gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
-                    gl::UseProgram(default_program);
                     gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
                     idx.0 += 1;
                 }
@@ -505,12 +513,12 @@ fn main() {
                 let view = glm::translate(&id, &mve);
                 let mvp = ortho * view * model;
                 
-                gl::UniformMatrix4fv(mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                gl::UseProgram(text_program);
+                gl::UniformMatrix4fv(text_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
                 gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
                 gl::BindVertexArray(vao);
                 gl::BindTexture(gl::TEXTURE_2D, text_texture_id);
                 gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
-                gl::UseProgram(default_program);
                 gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
             }
         }
@@ -523,6 +531,7 @@ fn main() {
         gl::DeleteBuffers(1, &vbo);
         gl::DeleteVertexArrays(1, &vao);
         gl::DeleteProgram(default_program);
+        gl::DeleteProgram(text_program);
         for container_idx in 0..CONTAINERS.len() {
             for image_idx in 0..CONTAINERS[container_idx].images.len() {
                 gl::DeleteTextures(1, &CONTAINERS[container_idx].images[image_idx].texture_id);
