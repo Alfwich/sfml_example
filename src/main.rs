@@ -22,43 +22,62 @@ struct Viewport {
 
 #[derive(Debug)]
 struct DImage {
+    pub loaded_failed: bool,
+    pub scale: f32,
     pub texture_id: u32,
-    texture_url: String,
-    pos: [i32; 2]
+    pub texture_url: String,
+}
+
+#[derive(Debug)]
+struct DImageRow {
+    pub loaded_failed: bool,
+    pub title: String,
+    //pub title_render_texture: RenderTexture,
+    pub images: Vec<DImage>,
+    pub offset: (f32, f32),
+    
+    refset_id: String,
+    refset_type: String,
 }
 
 fn load_image_from_url(client: &reqwest::blocking::Client, url: &str) -> Result<u32, String> {
-    println!("Getting image data for: {:?}", url);
-    let resp = client.get(url).send().unwrap().bytes().unwrap();
-    
-    unsafe {
-        let mut id : u32 = 0;
-        gl::GenTextures(1, &mut id);
-        if id != 0 {
-            gl::BindTexture(gl::TEXTURE_2D, id);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE.try_into().unwrap());
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE.try_into().unwrap());
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR.try_into().unwrap());
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR.try_into().unwrap());
-            let img_data = Image::from_memory(&resp);
-            match img_data {
-                Some(img_data) => {
-                    let img_data_ptr = img_data.pixel_data().as_ptr() as *const c_void;
-                    // RGBA since pixel_data pads to 4 channels
-                    gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA.try_into().unwrap(), 500, 281, 0, gl::RGBA, gl::UNSIGNED_BYTE, img_data_ptr);
-                    gl::GenerateMipmap(gl::TEXTURE_2D);
-                    gl::BindTexture(gl::TEXTURE_2D, 0);                
-                }
-                None => {
-                    gl::DeleteTextures(1, &id);
-                    println!("Bad Image for url: {:?}", url);
-                    return Err("Bad Image".to_string());
-                }
-            }
+    match client.get(url).send() {
+        Ok(response) => {
+            let resp_bytes = response.bytes().unwrap();
+            unsafe {
+                let mut id : u32 = 0;
+                gl::GenTextures(1, &mut id);
+                if id != 0 {
+                    gl::BindTexture(gl::TEXTURE_2D, id);
+                    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE.try_into().unwrap());
+                    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE.try_into().unwrap());
+                    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR.try_into().unwrap());
+                    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR.try_into().unwrap());
+                    let img_data = Image::from_memory(&resp_bytes);
+                    match img_data {
+                        Some(img_data) => {
+                            let img_data_ptr = img_data.pixel_data().as_ptr() as *const c_void;
+                            // RGBA since pixel_data pads to 4 channels
+                            gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA.try_into().unwrap(), 500, 281, 0, gl::RGBA, gl::UNSIGNED_BYTE, img_data_ptr);
+                            gl::GenerateMipmap(gl::TEXTURE_2D);
+                            gl::BindTexture(gl::TEXTURE_2D, 0);                
+                        }
+                        None => {
+                            gl::DeleteTextures(1, &id);
+                            println!("Bad Image for url: {:?}", url);
+                            return Err("Bad Image".to_string());
+                        }
+                    }
 
+                }
+                
+                return Ok(id);
+            }
+    
         }
-        
-        Ok(id)
+        Err(_) => {
+            return Err("Bad Image Url".to_string());
+        }
     }
 }
 
@@ -200,75 +219,186 @@ fn upload_buffer_data(vao: u32, vbo: u32, ebo: u32) {
 
 static WINDOW_SIZE: (u32, u32) = (1920, 1080);
 static APP_FPS: u32 = 60;
-static APP_DATA_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/home.json";
+static mut CONTAINERS: Vec<DImageRow> = Vec::new();
 
-static mut next_idx: usize = 0;
-static mut images : Vec<DImage> = Vec::new();
-
-lazy_static::lazy_static! {
-    static ref next_item: Mutex<i32> = Mutex::new(0i32);
+fn get_item_image_url_from_json_value(item: &serde_json::Value) -> String {
+    let mut url:String = "".to_string();
+    if item["image"]["tile"]["1.78"]["series"]["default"]["url"].is_string() {
+        url = item["image"]["tile"]["1.78"]["series"]["default"]["url"].to_string();
+    } else if item["image"]["tile"]["1.78"]["program"]["default"]["url"].is_string() {
+        url = item["image"]["tile"]["1.78"]["program"]["default"]["url"].to_string();
+    } else if item["image"]["tile"]["1.78"]["default"]["default"]["url"].is_string() {
+        url = item["image"]["tile"]["1.78"]["default"]["default"]["url"].to_string();
+    } else {
+        println!("Failed to fish out image url: {:#?}", item["image"]["tile"]["1.78"]);
+    }
+    
+    url[1..url.len()-1].to_string()
 }
 
+fn get_container_title_from_json_value(container: &serde_json::Value) -> String {
+    container["set"]["text"]["title"]["full"]["set"]["default"]["content"].to_string()
+}
+
+fn get_container_refset_id_from_json_value(container: &serde_json::Value) -> String {
+    let result = container["set"]["refId"].to_string();
+    if container["set"]["refId"].is_string() {
+        result[1..result.len()-1].to_string()
+    } else {
+        result
+    }
+}
+
+fn get_container_refset_type_from_json_value(container: &serde_json::Value) -> String {
+    let result = container["set"]["refType"].to_string();
+    if container["set"]["refType"].is_string() {
+        result[1..result.len()-1].to_string()
+    } else {
+        result
+    }
+}
+
+fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), dst: &mut [[u8; 1024]; 256], src: &[u8]) {
+    let y_offset = 255 - size.1;
+    for x in 0..size.0 {
+        for y in y_offset..(size.1 + y_offset) {
+            dst[y as usize][(x + offset.0) as usize] = src[x as usize + (((y - y_offset) * size.0) as usize)];
+        }
+    }
+}
+
+fn sw_render_text_to_buffer(str: &str) -> ([[u8; 1024]; 256], u32){
+    let mut result = [[0u8; 1024]; 256];
+    
+    static FONT_FILE: &str = "GlacialIndifference-Bold.otf";
+    let lib = freetype::Library::init().unwrap();
+    let face = lib.new_face(FONT_FILE, 0).unwrap();
+    face.set_char_size(40 * 128, 0, 100, 0).map_err(|err| println!("{:?}", err)).ok();
+    let mut offset = (0u32, 0u32);
+    for c in str.chars() {
+        face.load_char(c as usize, freetype::face::LoadFlag::RENDER).map_err(|err| println!("{:?}", err)).ok();
+        let glyph = face.glyph();
+        let glyph_bitmap = glyph.bitmap();
+        let bitmap_data = glyph_bitmap.buffer();
+        sw_blit_to_buffer(offset, (glyph_bitmap.width() as u32, glyph_bitmap.rows() as u32), &mut result, bitmap_data);
+        offset.0 += (glyph_bitmap.width() + 1) as u32;
+    }
+    
+    (result, offset.0)
+}
+
+fn render_text_to_texture(str: &str) -> u32 {
+        
+    unsafe {
+        let mut id : u32 = 0;
+        gl::GenTextures(1, &mut id);
+        gl::BindTexture(gl::TEXTURE_2D, id);
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE.try_into().unwrap());
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE.try_into().unwrap());
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR.try_into().unwrap());
+        gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR.try_into().unwrap());
+        gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+        let texture_data = sw_render_text_to_buffer(str);
+        let texture_data_ptr = texture_data.0.as_ptr() as *const c_void;
+        //println!("width: {:?}, rows: {:?}, data: {:?}", glyph_bitmap.width(), glyph_bitmap.rows(), bitmap_data);
+        gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RED.try_into().unwrap(), 1024, 256, 0, gl::RED, gl::UNSIGNED_BYTE, texture_data_ptr);
+        gl::GenerateMipmap(gl::TEXTURE_2D);
+        gl::BindTexture(gl::TEXTURE_2D, 0);
+        id
+    }
+}
 
 fn load_all_images() {
-    
+    static APP_DATA_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/home.json";
     unsafe {
-        next_idx = 0;
-        
         let resp = reqwest::blocking::get(APP_DATA_SOURCE).unwrap().text().unwrap();
         let data: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let containers: Vec<serde_json::Value> = data["data"]["StandardCollection"]["containers"].as_array().unwrap().to_vec();
-        let mut pos: (i32, i32) = (0, 0);
         for container in containers {
+            let title = get_container_title_from_json_value(&container);
+            let refset_id = get_container_refset_id_from_json_value(&container);
+            let refset_type = get_container_refset_type_from_json_value(&container);
+            println!("Found container with title: {:?}, refset_id: {:?}, refset_type: {:?}", title, refset_id, refset_type);
+            CONTAINERS.push(DImageRow {images: Vec::new(), title: title, refset_id: refset_id, refset_type: refset_type, offset: (0., 0.), loaded_failed: false});
             let items = container["set"]["items"].as_array();
             match items {
                 Some(arr) => {
                     for item in arr.to_vec() {
-                        let mut url:String = "".to_string();
-                        if item["image"]["tile"]["1.78"]["series"]["default"]["url"].is_string() {
-                            url = item["image"]["tile"]["1.78"]["series"]["default"]["url"].to_string();
-                        } else if item["image"]["tile"]["1.78"]["program"]["default"]["url"].is_string() {
-                            url = item["image"]["tile"]["1.78"]["program"]["default"]["url"].to_string();
-                        } else if item["image"]["tile"]["1.78"]["default"]["default"]["url"].is_string() {
-                            url = item["image"]["tile"]["1.78"]["default"]["default"]["url"].to_string();
-                        } else {
-                            println!("Failed to fish out image url: {:#?}", item["image"]["tile"]["1.78"]);
-                        }
-                        url = url[1..url.len()-1].to_string();
-                        
-                        images.push( DImage { texture_url: url.to_string(), texture_id: 0, pos: [pos.0, pos.1]} );
-                        pos.0 += 1;
+                        let url = get_item_image_url_from_json_value(&item);
+                        CONTAINERS[CONTAINERS.len() - 1].images.push( DImage { texture_url: url.to_string(), texture_id: 0, scale: 1.0, loaded_failed: false } );
                     }
                 },
                 _ => {}
             }
-            pos.1 += 1;
-            pos.0 = 0;
         }
         
-        // Spawn threads to acquire images
-        for idx in 0..8 {
+        
+        lazy_static::lazy_static! {
+            static ref NEXT_IDS_LOCK: Mutex<i32> = Mutex::new(0i32);
+        }
+    
+        static APP_DATA_REFSET_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/sets/{{id}}.json";
+        static mut NEXT_IDX: usize = 0;
+        
+        NEXT_IDX = 0;
+        // Spawn threads to acquire images and populate refsets
+        for _thread_idx in 0..8 {
             thread::spawn(|| {
                 let client = reqwest::blocking::Client::new();
-                let context = Context::new();
+                // Create GL context to allow async threads to load image data
+                let _context = Context::new();
                 loop {
                     let next;
                     {
-                        next_item.lock();
-                        next = next_idx;
-                        next_idx += 1;
+                        NEXT_IDS_LOCK.lock().map_err(|err| println!("{:?}", err)).ok();
+                        next = NEXT_IDX;
+                        NEXT_IDX += 1;
                     }
                     
-                    if next >= images.len() {
+                    if next >= CONTAINERS.len() {
                         break;
                     }
                     
-                    match load_image_from_url(&client, &images[next].texture_url) {
-                        Ok(texture_id) => {
-                            images[next].texture_id = texture_id;
-                        },
-                        _ => {}
-                    }        
+                    // Populate refset if needed
+                    if CONTAINERS[next].refset_id != "null" {
+                        let set_id = &CONTAINERS[next].refset_id;
+                        let set_type = &CONTAINERS[next].refset_type;
+                        let set_url = APP_DATA_REFSET_SOURCE.replace("{{id}}", set_id);
+                        println!("Loading refset: {:?}, url: {:?}", CONTAINERS[next].refset_id, set_url);
+                        let ref_resp = reqwest::blocking::get(set_url).unwrap().text().unwrap();
+                        let ref_data: serde_json::Value = serde_json::from_str(&ref_resp).unwrap();
+                        
+                        let mut refset_data_key = set_type;
+                        for key in ref_data["data"].as_object().unwrap().keys() {
+                            refset_data_key = key;
+                            break;
+                        }
+                        
+                        let items = ref_data["data"][refset_data_key]["items"].as_array();
+                        match items {
+                            Some(arr) => {
+                                for item in arr.to_vec() {
+                                    let url = get_item_image_url_from_json_value(&item);
+                                    CONTAINERS[next].images.push( DImage { texture_url: url.to_string(), texture_id: 0, scale: 1.0, loaded_failed: false } );
+                                }
+                            },
+                            _ => {
+                                CONTAINERS[next].loaded_failed = true;
+                                println!("Failed to load refset id: {:?}, type: {:?}", set_id, set_type);
+                            }
+                        }
+                    }
+                    
+                    for image_idx in 0..CONTAINERS[next].images.len() {
+                        match load_image_from_url(&client, &CONTAINERS[next].images[image_idx].texture_url) {
+                            Ok(texture_id) => {
+                                CONTAINERS[next].images[image_idx].texture_id = texture_id;
+                            },
+                            _ => {
+                                CONTAINERS[next].images[image_idx].loaded_failed = true;
+                            }
+                        }        
+                    }
                 }
             });
         }
@@ -291,6 +421,7 @@ fn main() {
     let vbo = gen_buffer();
     let ebo = gen_buffer();
     let default_program = create_default_program();
+    let text_texture_id = render_text_to_texture("Hello World!\n");
     
     upload_buffer_data(vao, vbo, ebo);
     
@@ -338,17 +469,46 @@ fn main() {
         unsafe {
             gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
             
-            for image in &images {
-                let scale = glm::make_vec3(&[500., 281., 1.0]);
+            let mut idx = (0, 0);
+            for container_idx in 0..CONTAINERS.len() {
+                if CONTAINERS[container_idx].loaded_failed {
+                    continue;
+                }
+                
+                for image_idx in 0..CONTAINERS[container_idx].images.len() {
+                    if CONTAINERS[container_idx].images[image_idx].loaded_failed {
+                        continue;
+                    }
+                    
+                    let scale = glm::make_vec3(&[500., 281., 1.0]);
+                    let model = glm::scale(&id, &scale);
+                    let mve = base_move + glm::make_vec3(&[viewport.pos[0] + idx.0 as f32 * 525., viewport.pos[1] - idx.1 as f32 * 300., 0.]);
+                    let view = glm::translate(&id, &mve);
+                    let mvp = ortho * view * model;
+                    
+                    gl::UniformMatrix4fv(mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                    gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
+                    gl::BindVertexArray(vao);
+                    gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].images[image_idx].texture_id);
+                    gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
+                    gl::UseProgram(default_program);
+                    gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
+                    idx.0 += 1;
+                }
+                idx.1 += 1;
+                idx.0 = 0;
+            }
+            { // Test for text
+                let scale = glm::make_vec3(&[1024., 256., 1.0]);
                 let model = glm::scale(&id, &scale);
-                let mve = base_move + glm::make_vec3(&[viewport.pos[0] + image.pos[0] as f32 * 525., viewport.pos[1] - image.pos[1] as f32 * 300., 0.]);
+                let mve = base_move + glm::make_vec3(&[viewport.pos[0], viewport.pos[1], 0.]);
                 let view = glm::translate(&id, &mve);
                 let mvp = ortho * view * model;
                 
                 gl::UniformMatrix4fv(mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
                 gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
                 gl::BindVertexArray(vao);
-                gl::BindTexture(gl::TEXTURE_2D, image.texture_id);
+                gl::BindTexture(gl::TEXTURE_2D, text_texture_id);
                 gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
                 gl::UseProgram(default_program);
                 gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
@@ -363,9 +523,12 @@ fn main() {
         gl::DeleteBuffers(1, &vbo);
         gl::DeleteVertexArrays(1, &vao);
         gl::DeleteProgram(default_program);
-        for image in &images {
-            gl::DeleteTextures(1, &image.texture_id);
+        for container_idx in 0..CONTAINERS.len() {
+            for image_idx in 0..CONTAINERS[container_idx].images.len() {
+                gl::DeleteTextures(1, &CONTAINERS[container_idx].images[image_idx].texture_id);
+            }
         }
+        CONTAINERS.clear();
     }
     
     gl_loader::end_gl();
