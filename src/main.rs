@@ -31,7 +31,7 @@ struct DImage {
 #[derive(Debug)]
 struct DImageRow {
     pub loaded_failed: bool,
-    pub title: String,
+    pub title: RenderedImage,
     
     pub images: Vec<DImage>,
     pub offset: (f32, f32),
@@ -240,7 +240,12 @@ fn get_item_image_url_from_json_value(item: &serde_json::Value) -> String {
 }
 
 fn get_container_title_from_json_value(container: &serde_json::Value) -> String {
-    container["set"]["text"]["title"]["full"]["set"]["default"]["content"].to_string()
+    let result = container["set"]["text"]["title"]["full"]["set"]["default"]["content"].to_string();
+    if container["set"]["text"]["title"]["full"]["set"]["default"]["content"].is_string() {
+        result[1..result.len()-1].to_string()
+    } else {
+        result
+    }
 }
 
 fn get_container_refset_id_from_json_value(container: &serde_json::Value) -> String {
@@ -262,7 +267,7 @@ fn get_container_refset_type_from_json_value(container: &serde_json::Value) -> S
 }
 
 fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), top: i32, dst: &mut [[u8; 1024]; 256], src: &[u8]) {
-    println!("top: {:?}", top);
+    //println!("top: {:?}", top);
     let y_offset = 128 - top as u32;
     for x in 0..size.0 {
         for y in y_offset..(size.1 + y_offset) {
@@ -306,7 +311,6 @@ fn render_text_to_texture(str: &str) -> RenderedImage {
         let texture_data_ptr = texture_data.0.as_ptr() as *const c_void;
         
         gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RED.try_into().unwrap(), 1024, 256, 0, gl::RED, gl::UNSIGNED_BYTE, texture_data_ptr);
-        //gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RED.try_into().unwrap(), texture_data.1.0 as i32, texture_data.1.1 as i32, 0, gl::RED, gl::UNSIGNED_BYTE, texture_data_ptr);
         gl::GenerateMipmap(gl::TEXTURE_2D);
         gl::BindTexture(gl::TEXTURE_2D, 0);
     
@@ -325,7 +329,7 @@ fn load_all_images() {
         let data: serde_json::Value = serde_json::from_str(&resp).unwrap();
         let containers: Vec<serde_json::Value> = data["data"]["StandardCollection"]["containers"].as_array().unwrap().to_vec();
         for container in containers {
-            let title = get_container_title_from_json_value(&container);
+            let title = render_text_to_texture(&get_container_title_from_json_value(&container));
             let refset_id = get_container_refset_id_from_json_value(&container);
             let refset_type = get_container_refset_type_from_json_value(&container);
             println!("Found container with title: {:?}, refset_id: {:?}, refset_type: {:?}", title, refset_id, refset_type);
@@ -352,7 +356,7 @@ fn load_all_images() {
         
         NEXT_IDX = 0;
         // Spawn threads to acquire images and populate refsets
-        for _thread_idx in 0..8 {
+        for _thread_idx in 0..1 {
             thread::spawn(|| {
                 let client = reqwest::blocking::Client::new();
                 // Create GL context to allow async threads to load image data
@@ -432,7 +436,6 @@ fn main() {
     let ebo = gen_buffer();
     let default_program = create_and_link_program("vertex.glsl", "fragment.glsl");
     let text_program = create_and_link_program("vertex.glsl", "text.glsl");
-    let text_texture = render_text_to_texture("The quick        brown fox jumps over the lazy dog");
     
     upload_buffer_data(vao, vbo, ebo);
     
@@ -447,6 +450,7 @@ fn main() {
     unsafe { text_mvp_loc = gl::GetUniformLocation(text_program, mvp_name.as_ptr() as *const i8); };
     
     let mut viewport = Viewport { pos: [0., 0.] };
+    let mut selected_container_idx = 0;
     
     while window.is_open() {
         while let Some(event) = window.poll_event() {
@@ -457,16 +461,28 @@ fn main() {
                 Event::KeyPressed { code, .. } => {
                     match code {
                         Key::A => {
-                            viewport.pos[0] += 100.;
+                            unsafe { 
+                                if CONTAINERS[selected_container_idx].offset.0 < 0. {
+                                    CONTAINERS[selected_container_idx].offset.0 += 525. 
+                                }
+                            };
                         },
                         Key::D => {
-                            viewport.pos[0] -= 100.;
+                            unsafe { 
+                                CONTAINERS[selected_container_idx].offset.0 -= 525. 
+                            };
                         },
                         Key::W => {
-                            viewport.pos[1] -= 100.;
+                            if selected_container_idx >= 1 {
+                                selected_container_idx -= 1;
+                            }
                         },
                         Key::S => {
-                            viewport.pos[1] += 100.;
+                            unsafe {
+                                if selected_container_idx < CONTAINERS.len() - 1 {
+                                    selected_container_idx += 1;
+                                }
+                            }
                         },
                         _ => {}
                     }
@@ -476,6 +492,9 @@ fn main() {
                 _ => {}
             }
         }
+        
+        viewport.pos[0] = -700.;
+        viewport.pos[1] = 500. + (390 * selected_container_idx) as f32;
         
         window.set_active(true);
         
@@ -489,44 +508,48 @@ fn main() {
                     continue;
                 }
                 
+                { 
+                    let scale = glm::make_vec3(&[1024., 256., 1.]);
+                    let model = glm::scale(&id, &scale);
+                    let mve = base_move + glm::make_vec3(&[viewport.pos[0] + 266., viewport.pos[1] - idx.1 as f32, 0.]);
+                    let view = glm::translate(&id, &mve);
+                    let mvp = ortho * view * model;
+                    
+                    gl::UseProgram(text_program);
+                    gl::UniformMatrix4fv(text_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                    gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
+                    gl::BindVertexArray(vao);
+                    gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].title.texture_id);
+                    gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
+                    gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
+                    
+                    idx.1 += 160;
+                }
+                
                 for image_idx in 0..CONTAINERS[container_idx].images.len() {
                     if CONTAINERS[container_idx].images[image_idx].loaded_failed {
                         continue;
                     }
                     
-                    let scale = glm::make_vec3(&[500., 281., 1.0]);
-                    let model = glm::scale(&id, &scale);
-                    let mve = base_move + glm::make_vec3(&[viewport.pos[0] + idx.0 as f32 * 525., viewport.pos[1] - idx.1 as f32 * 300., 0.]);
-                    let view = glm::translate(&id, &mve);
-                    let mvp = ortho * view * model;
-                    
-                    gl::UseProgram(default_program);
-                    gl::UniformMatrix4fv(default_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                    gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
-                    gl::BindVertexArray(vao);
-                    gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].images[image_idx].texture_id);
-                    gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
-                    gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
-                    idx.0 += 1;
+                    {
+                        let scale = glm::make_vec3(&[500., 281., 1.0]);
+                        let model = glm::scale(&id, &scale);
+                        let mve = base_move + glm::make_vec3(&[viewport.pos[0] + idx.0 as f32 + CONTAINERS[container_idx].offset.0 as f32, viewport.pos[1] - idx.1 as f32, 0.]);
+                        let view = glm::translate(&id, &mve);
+                        let mvp = ortho * view * model;
+                        
+                        gl::UseProgram(default_program);
+                        gl::UniformMatrix4fv(default_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                        gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
+                        gl::BindVertexArray(vao);
+                        gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].images[image_idx].texture_id);
+                        gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
+                        gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
+                        idx.0 += 525;
+                    }
                 }
-                idx.1 += 1;
+                idx.1 += 230;
                 idx.0 = 0;
-            }
-            { // Test for text
-                //let scale = glm::make_vec3(&[text_texture.width as f32, text_texture.height as f32, 1.0f32]);
-                let scale = glm::make_vec3(&[1024., 256., 1.]);
-                let model = glm::scale(&id, &scale);
-                let mve = base_move + glm::make_vec3(&[viewport.pos[0], viewport.pos[1], 0.]);
-                let view = glm::translate(&id, &mve);
-                let mvp = ortho * view * model;
-                
-                gl::UseProgram(text_program);
-                gl::UniformMatrix4fv(text_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
-                gl::BindVertexArray(vao);
-                gl::BindTexture(gl::TEXTURE_2D, text_texture.texture_id);
-                gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
-                gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
             }
         }
         
@@ -540,6 +563,7 @@ fn main() {
         gl::DeleteProgram(default_program);
         gl::DeleteProgram(text_program);
         for container_idx in 0..CONTAINERS.len() {
+            gl::DeleteTextures(1, &CONTAINERS[container_idx].title.texture_id);
             for image_idx in 0..CONTAINERS[container_idx].images.len() {
                 gl::DeleteTextures(1, &CONTAINERS[container_idx].images[image_idx].texture_id);
             }
