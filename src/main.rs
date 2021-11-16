@@ -40,6 +40,13 @@ struct DImageRow {
     refset_type: String,
 }
 
+#[derive(Debug)]
+struct RenderedImage {
+    texture_id: u32,
+    width: u32,
+    height: u32
+}
+
 fn load_image_from_url(client: &reqwest::blocking::Client, url: &str) -> Result<u32, String> {
     match client.get(url).send() {
         Ok(response) => {
@@ -133,14 +140,6 @@ fn create_shader(shader_type: u32, shader_source_location: &str) -> Result<u32, 
         } 
         Err("Failed to compile shader")
     }
-}
-
-fn create_default_program() -> u32{
-    create_and_link_program("vertex.glsl", "fragment.glsl")
-}
-
-fn create_text_program() -> u32{
-    create_and_link_program("vertex.glsl", "text.glsl")
 }
 
 fn create_and_link_program(vertex_shader_source: &str, fragment_shader_source: &str) -> u32 {
@@ -262,8 +261,9 @@ fn get_container_refset_type_from_json_value(container: &serde_json::Value) -> S
     }
 }
 
-fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), dst: &mut [[u8; 1024]; 256], src: &[u8]) {
-    let y_offset = 255 - size.1;
+fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), top: i32, dst: &mut [[u8; 1024]; 256], src: &[u8]) {
+    println!("top: {:?}", top);
+    let y_offset = 128 - top as u32;
     for x in 0..size.0 {
         for y in y_offset..(size.1 + y_offset) {
             dst[y as usize][(x + offset.0) as usize] = src[x as usize + (((y - y_offset) * size.0) as usize)];
@@ -271,7 +271,7 @@ fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), dst: &mut [[u8; 1024]
     }
 }
 
-fn sw_render_text_to_buffer(str: &str) -> ([[u8; 1024]; 256], u32){
+fn sw_render_text_to_buffer(str: &str) -> ([[u8; 1024]; 256], (u32, u32)){
     let mut result = [[0u8; 1024]; 256];
     
     static FONT_FILE: &str = "GlacialIndifference-Bold.otf";
@@ -284,14 +284,14 @@ fn sw_render_text_to_buffer(str: &str) -> ([[u8; 1024]; 256], u32){
         let glyph = face.glyph();
         let glyph_bitmap = glyph.bitmap();
         let bitmap_data = glyph_bitmap.buffer();
-        sw_blit_to_buffer(offset, (glyph_bitmap.width() as u32, glyph_bitmap.rows() as u32), &mut result, bitmap_data);
-        offset.0 += (glyph_bitmap.width() + 1) as u32;
+        sw_blit_to_buffer(offset, (glyph_bitmap.width() as u32, glyph_bitmap.rows() as u32), glyph.bitmap_top(), &mut result, bitmap_data);
+        offset.0 += (glyph.advance().x / 64) as u32;
     }
     
-    (result, offset.0)
+    (result, offset)
 }
 
-fn render_text_to_texture(str: &str) -> u32 {
+fn render_text_to_texture(str: &str) -> RenderedImage {
         
     unsafe {
         let mut id : u32 = 0;
@@ -304,11 +304,17 @@ fn render_text_to_texture(str: &str) -> u32 {
         gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
         let texture_data = sw_render_text_to_buffer(str);
         let texture_data_ptr = texture_data.0.as_ptr() as *const c_void;
-        //println!("width: {:?}, rows: {:?}, data: {:?}", glyph_bitmap.width(), glyph_bitmap.rows(), bitmap_data);
+        
         gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RED.try_into().unwrap(), 1024, 256, 0, gl::RED, gl::UNSIGNED_BYTE, texture_data_ptr);
+        //gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RED.try_into().unwrap(), texture_data.1.0 as i32, texture_data.1.1 as i32, 0, gl::RED, gl::UNSIGNED_BYTE, texture_data_ptr);
         gl::GenerateMipmap(gl::TEXTURE_2D);
         gl::BindTexture(gl::TEXTURE_2D, 0);
-        id
+    
+        RenderedImage {
+            texture_id: id,
+            width: texture_data.1.0,
+            height: texture_data.1.1
+        }
     }
 }
 
@@ -424,9 +430,9 @@ fn main() {
     let vao = gen_vertex_buffer();
     let vbo = gen_buffer();
     let ebo = gen_buffer();
-    let default_program = create_default_program();
-    let text_program = create_text_program();
-    let text_texture_id = render_text_to_texture("The quick        brown fox jumps over the lazy dog");
+    let default_program = create_and_link_program("vertex.glsl", "fragment.glsl");
+    let text_program = create_and_link_program("vertex.glsl", "text.glsl");
+    let text_texture = render_text_to_texture("The quick        brown fox jumps over the lazy dog");
     
     upload_buffer_data(vao, vbo, ebo);
     
@@ -507,7 +513,8 @@ fn main() {
                 idx.0 = 0;
             }
             { // Test for text
-                let scale = glm::make_vec3(&[1024., 256., 1.0]);
+                //let scale = glm::make_vec3(&[text_texture.width as f32, text_texture.height as f32, 1.0f32]);
+                let scale = glm::make_vec3(&[1024., 256., 1.]);
                 let model = glm::scale(&id, &scale);
                 let mve = base_move + glm::make_vec3(&[viewport.pos[0], viewport.pos[1], 0.]);
                 let view = glm::translate(&id, &mve);
@@ -517,7 +524,7 @@ fn main() {
                 gl::UniformMatrix4fv(text_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
                 gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
                 gl::BindVertexArray(vao);
-                gl::BindTexture(gl::TEXTURE_2D, text_texture_id);
+                gl::BindTexture(gl::TEXTURE_2D, text_texture.texture_id);
                 gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
                 gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
             }
