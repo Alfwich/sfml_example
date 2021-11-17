@@ -26,6 +26,7 @@ struct Viewport {
 struct DImage {
     pub loaded_failed: bool,
     pub scale: f32,
+    pub border: f32,
     pub texture_id: u32,
     pub texture_url: String,
 }
@@ -335,14 +336,14 @@ fn load_page_data() {
             let title = render_text_to_texture(&get_container_title_from_json_value(&container));
             let refset_id = get_container_refset_id_from_json_value(&container);
             let refset_type = get_container_refset_type_from_json_value(&container);
-            println!("Found container with title: {:?}, refset_id: {:?}, refset_type: {:?}", title, refset_id, refset_type);
+            //println!("Found container with title: {:?}, refset_id: {:?}, refset_type: {:?}", title, refset_id, refset_type);
             CONTAINERS.push(DImageRow {images: Vec::new(), title: title, refset_id: refset_id, refset_type: refset_type, selected_tile_idx: 0., desired_selected_tile_idx: 0., loaded_failed: false});
             let items = container["set"]["items"].as_array();
             match items {
                 Some(arr) => {
                     for item in arr.to_vec() {
                         let url = get_item_image_url_from_json_value(&item);
-                        CONTAINERS[CONTAINERS.len() - 1].images.push( DImage { texture_url: url.to_string(), texture_id: 0, scale: 1.0, loaded_failed: false } );
+                        CONTAINERS[CONTAINERS.len() - 1].images.push( DImage { texture_url: url.to_string(), texture_id: 0, scale: 1., border: 0., loaded_failed: false } );
                     }
                 },
                 _ => {}
@@ -377,7 +378,7 @@ fn load_page_data() {
                         let set_id = &CONTAINERS[next].refset_id;
                         let set_type = &CONTAINERS[next].refset_type;
                         let set_url = APP_DATA_REFSET_SOURCE.replace("{{id}}", set_id);
-                        println!("Loading refset: {:?}, url: {:?}", CONTAINERS[next].refset_id, set_url);
+                        //println!("Loading refset: {:?}, url: {:?}", CONTAINERS[next].refset_id, set_url);
                         let ref_resp = reqwest::blocking::get(set_url).unwrap().text().unwrap();
                         let ref_data: serde_json::Value = serde_json::from_str(&ref_resp).unwrap();
                         
@@ -392,7 +393,7 @@ fn load_page_data() {
                             Some(arr) => {
                                 for item in arr.to_vec() {
                                     let url = get_item_image_url_from_json_value(&item);
-                                    CONTAINERS[next].images.push( DImage { texture_url: url.to_string(), texture_id: 0, scale: 1.0, loaded_failed: false } );
+                                    CONTAINERS[next].images.push( DImage { texture_url: url.to_string(), texture_id: 0, scale: 1., border:0., loaded_failed: false } );
                                 }
                             },
                             _ => {
@@ -437,32 +438,37 @@ fn main() {
     let vao = gen_vertex_buffer();
     let vbo = gen_buffer();
     let ebo = gen_buffer();
-    let default_program = create_and_link_program("vertex.glsl", "fragment.glsl");
+    let tile_program = create_and_link_program("vertex.glsl", "tile.glsl");
     let text_program = create_and_link_program("vertex.glsl", "text.glsl");
     
     upload_buffer_data(vao, vbo, ebo);
     
     let ortho = glm::ortho(0.0f32, WINDOW_SIZE.0 as f32, 0., WINDOW_SIZE.1 as f32, -10., 100.);
     let id = glm::identity::<f32, 4>();
-    let base_move = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2. - 630., WINDOW_SIZE.1 as f32 / 2. + 450., 0.0]);
+    let base_move = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2. - 550., WINDOW_SIZE.1 as f32 / 2. + 350., 0.0]);
     
-    let mvp_name = "mvp\0".as_bytes();
-    let default_mvp_loc; 
+    let tile_mvp_loc; 
+    let tile_border_loc; 
     let text_mvp_loc; 
     
     unsafe { 
-        default_mvp_loc = gl::GetUniformLocation(default_program, mvp_name.as_ptr() as *const i8);
+        let mvp_name = "mvp\0".as_bytes();
+        let border_name = "border\0".as_bytes();
+        
+        tile_mvp_loc = gl::GetUniformLocation(tile_program, mvp_name.as_ptr() as *const i8);
+        tile_border_loc = gl::GetUniformLocation(tile_program, border_name.as_ptr() as *const i8);
         text_mvp_loc = gl::GetUniformLocation(text_program, mvp_name.as_ptr() as *const i8); 
     }
     
     let mut viewport = Viewport { pos: [0., 0.], desired_pos: [0., 0.] };
     let mut selected_container_idx = 0;
-    
     let mut last = Instant::now();
+    
     while window.is_open() {
         let current = Instant::now();
         let dt = (current - last).as_millis() as f32 / 1000.;
         last = current;
+        
         while let Some(event) = window.poll_event() {
             match event {
                 Event::Closed => {
@@ -499,14 +505,14 @@ fn main() {
                         _ => {}
                     }
                     
-                    println!("KEY PRESSED: {:?}", code)
+                    //println!("KEY PRESSED: {:?}", code)
                 }
                 _ => {}
             }
         }
         
         viewport.desired_pos[1] = 470. * selected_container_idx as f32;
-        viewport.pos[1] += ((viewport.desired_pos[1] - viewport.pos[1]) / 0.2) * dt;
+        viewport.pos[1] += ((viewport.desired_pos[1] - viewport.pos[1]) / 0.1) * dt;
         
         window.set_active(true);
         
@@ -531,7 +537,7 @@ fn main() {
                     let view = glm::translate(&id, &mve);
                     let mvp = ortho * view * model;
                     
-                    CONTAINERS[container_idx].selected_tile_idx += ((CONTAINERS[container_idx].desired_selected_tile_idx - CONTAINERS[container_idx].selected_tile_idx) / 0.2) * dt;
+                    CONTAINERS[container_idx].selected_tile_idx += ((CONTAINERS[container_idx].desired_selected_tile_idx - CONTAINERS[container_idx].selected_tile_idx) / 0.1) * dt;
                     
                     gl::UseProgram(text_program);
                     gl::UniformMatrix4fv(text_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
@@ -545,10 +551,12 @@ fn main() {
                 
                 for image_idx in 0..CONTAINERS[container_idx].images.len() {
                     if selected_tile_idx_i32 == image_idx && selected_container_idx == container_idx {
+                        CONTAINERS[container_idx].images[image_idx].border = 0.01;
                         if CONTAINERS[container_idx].images[image_idx].scale < 1.15 {
                             CONTAINERS[container_idx].images[image_idx].scale += 1. * dt;
                         }
                     } else if CONTAINERS[container_idx].images[image_idx].scale > 1. {
+                        CONTAINERS[container_idx].images[image_idx].border = 0.;
                         CONTAINERS[container_idx].images[image_idx].scale -= 1. * dt;
                         if CONTAINERS[container_idx].images[image_idx].scale < 1. {
                             CONTAINERS[container_idx].images[image_idx].scale = 1.;
@@ -562,8 +570,10 @@ fn main() {
                         let view = glm::translate(&id, &mve);
                         let mvp = ortho * view * model;
                         
-                        gl::UseProgram(default_program);
-                        gl::UniformMatrix4fv(default_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                        gl::UseProgram(tile_program);
+                        gl::UniformMatrix4fv(tile_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                        // TODO: x, y border factors
+                        gl::Uniform1f(tile_border_loc, CONTAINERS[container_idx].images[image_idx].border);
                         // Complete hack to make it look better
                         if CONTAINERS[container_idx].images[image_idx].loaded_failed {
                             let next_idx = (image_idx + 3) % CONTAINERS[container_idx].images.len();
@@ -587,7 +597,7 @@ fn main() {
         gl::DeleteBuffers(1, &ebo);
         gl::DeleteBuffers(1, &vbo);
         gl::DeleteVertexArrays(1, &vao);
-        gl::DeleteProgram(default_program);
+        gl::DeleteProgram(tile_program);
         gl::DeleteProgram(text_program);
         for container_idx in 0..CONTAINERS.len() {
             gl::DeleteTextures(1, &CONTAINERS[container_idx].title.texture_id);
