@@ -6,6 +6,7 @@ use core::ffi::c_void;
 use core::result::Result;
 use std::thread;
 use std::sync::{Mutex};
+use std::time::{Instant};
 
 extern crate nalgebra_glm as glm;
 
@@ -17,7 +18,8 @@ struct Vertex {
 
 #[derive(Debug)]
 struct Viewport {
-    pos: [f32; 2]
+    pos: [f32; 2],
+    desired_pos: [f32; 2]
 }
 
 #[derive(Debug)]
@@ -34,7 +36,8 @@ struct DImageRow {
     pub title: RenderedImage,
     
     pub images: Vec<DImage>,
-    pub offset: (f32, f32),
+    pub selected_tile_idx: f32,
+    pub desired_selected_tile_idx: f32,
     
     refset_id: String,
     refset_type: String,
@@ -277,7 +280,7 @@ fn sw_render_text_to_buffer(str: &str) -> ([[u8; 1024]; 256], (u32, u32)){
     static FONT_FILE: &str = "GlacialIndifference-Bold.otf";
     let lib = freetype::Library::init().unwrap();
     let face = lib.new_face(FONT_FILE, 0).unwrap();
-    face.set_char_size(40 * 32, 0, 100, 0).map_err(|err| println!("{:?}", err)).ok();
+    face.set_char_size(80 * 32, 0, 100, 0).map_err(|err| println!("{:?}", err)).ok();
     let mut offset = (0u32, 0u32);
     for c in str.chars() {
         face.load_char(c as usize, freetype::face::LoadFlag::RENDER).map_err(|err| println!("{:?}", err)).ok();
@@ -333,7 +336,7 @@ fn load_page_data() {
             let refset_id = get_container_refset_id_from_json_value(&container);
             let refset_type = get_container_refset_type_from_json_value(&container);
             println!("Found container with title: {:?}, refset_id: {:?}, refset_type: {:?}", title, refset_id, refset_type);
-            CONTAINERS.push(DImageRow {images: Vec::new(), title: title, refset_id: refset_id, refset_type: refset_type, offset: (0., 0.), loaded_failed: false});
+            CONTAINERS.push(DImageRow {images: Vec::new(), title: title, refset_id: refset_id, refset_type: refset_type, selected_tile_idx: 0., desired_selected_tile_idx: 0., loaded_failed: false});
             let items = container["set"]["items"].as_array();
             match items {
                 Some(arr) => {
@@ -419,7 +422,7 @@ static mut CONTAINERS: Vec<DImageRow> = Vec::new();
 
 fn main() {
     static WINDOW_SIZE: (u32, u32) = (1920, 1080);
-    static APP_FPS: u32 = 60;
+    static APP_FPS: u32 = 165;
     
     // Creates GL context internally
     let mut window = Window::new(WINDOW_SIZE, "SFML Example", Style::CLOSE, &Default::default());
@@ -441,7 +444,7 @@ fn main() {
     
     let ortho = glm::ortho(0.0f32, WINDOW_SIZE.0 as f32, 0., WINDOW_SIZE.1 as f32, -10., 100.);
     let id = glm::identity::<f32, 4>();
-    let base_move = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2. - 700., WINDOW_SIZE.1 as f32 / 2. + 500., 0.0]);
+    let base_move = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2. - 630., WINDOW_SIZE.1 as f32 / 2. + 450., 0.0]);
     
     let mvp_name = "mvp\0".as_bytes();
     let default_mvp_loc; 
@@ -452,10 +455,14 @@ fn main() {
         text_mvp_loc = gl::GetUniformLocation(text_program, mvp_name.as_ptr() as *const i8); 
     }
     
-    let mut viewport = Viewport { pos: [0., 0.] };
+    let mut viewport = Viewport { pos: [0., 0.], desired_pos: [0., 0.] };
     let mut selected_container_idx = 0;
     
+    let mut last = Instant::now();
     while window.is_open() {
+        let current = Instant::now();
+        let dt = (current - last).as_millis() as f32 / 1000.;
+        last = current;
         while let Some(event) = window.poll_event() {
             match event {
                 Event::Closed => {
@@ -463,16 +470,18 @@ fn main() {
                 },
                 Event::KeyPressed { code, .. } => {
                     match code {
-                        Key::A => {
+                        Key::D => {
                             unsafe { 
-                                if CONTAINERS[selected_container_idx].offset.0 < 0. {
-                                    CONTAINERS[selected_container_idx].offset.0 += 525. 
+                                if CONTAINERS[selected_container_idx].desired_selected_tile_idx < (CONTAINERS[selected_container_idx].images.len() - 1) as f32 {
+                                    CONTAINERS[selected_container_idx].desired_selected_tile_idx += 1.;
                                 }
                             };
                         },
-                        Key::D => {
+                        Key::A => {
                             unsafe { 
-                                CONTAINERS[selected_container_idx].offset.0 -= 525. 
+                                if CONTAINERS[selected_container_idx].desired_selected_tile_idx > 0. {
+                                    CONTAINERS[selected_container_idx].desired_selected_tile_idx -= 1.;
+                                }
                             };
                         },
                         Key::W => {
@@ -496,7 +505,8 @@ fn main() {
             }
         }
         
-        viewport.pos[1] = (390 * selected_container_idx) as f32;
+        viewport.desired_pos[1] = 470. * selected_container_idx as f32;
+        viewport.pos[1] += ((viewport.desired_pos[1] - viewport.pos[1]) / 0.2) * dt;
         
         window.set_active(true);
         
@@ -521,34 +531,51 @@ fn main() {
                     let view = glm::translate(&id, &mve);
                     let mvp = ortho * view * model;
                     
+                    CONTAINERS[container_idx].selected_tile_idx += ((CONTAINERS[container_idx].desired_selected_tile_idx - CONTAINERS[container_idx].selected_tile_idx) / 0.2) * dt;
+                    
                     gl::UseProgram(text_program);
                     gl::UniformMatrix4fv(text_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
                     gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].title.texture_id);
                     gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
                     
-                    idx.1 += 160;
+                    idx.1 += 190;
                 }
                 
+                let selected_tile_idx_i32 = CONTAINERS[container_idx].desired_selected_tile_idx.round() as usize;
+                
                 for image_idx in 0..CONTAINERS[container_idx].images.len() {
-                    if CONTAINERS[container_idx].images[image_idx].loaded_failed {
-                        continue;
+                    if selected_tile_idx_i32 == image_idx && selected_container_idx == container_idx {
+                        if CONTAINERS[container_idx].images[image_idx].scale < 1.15 {
+                            CONTAINERS[container_idx].images[image_idx].scale += 1. * dt;
+                        }
+                    } else if CONTAINERS[container_idx].images[image_idx].scale > 1. {
+                        CONTAINERS[container_idx].images[image_idx].scale -= 1. * dt;
+                        if CONTAINERS[container_idx].images[image_idx].scale < 1. {
+                            CONTAINERS[container_idx].images[image_idx].scale = 1.;
+                        }
                     }
                     
                     {
-                        let scale = glm::make_vec3(&[500., 281., 1.0]);
+                        let scale = glm::make_vec3(&[500. * CONTAINERS[container_idx].images[image_idx].scale, 281. * CONTAINERS[container_idx].images[image_idx].scale, 1.0]);
                         let model = glm::scale(&id, &scale);
-                        let mve = base_move + glm::make_vec3(&[viewport.pos[0] + idx.0 as f32 + CONTAINERS[container_idx].offset.0 as f32, viewport.pos[1] - idx.1 as f32, 0.]);
+                        let mve = base_move + glm::make_vec3(&[viewport.pos[0] + idx.0 as f32 - (CONTAINERS[container_idx].selected_tile_idx * 625.) as f32, viewport.pos[1] - idx.1 as f32, 0.]);
                         let view = glm::translate(&id, &mve);
                         let mvp = ortho * view * model;
                         
                         gl::UseProgram(default_program);
                         gl::UniformMatrix4fv(default_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                        gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].images[image_idx].texture_id);
+                        // Complete hack to make it look better
+                        if CONTAINERS[container_idx].images[image_idx].loaded_failed {
+                            let next_idx = (image_idx + 3) % CONTAINERS[container_idx].images.len();
+                            gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].images[next_idx].texture_id);
+                        } else {
+                            gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].images[image_idx].texture_id);
+                        }
                         gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
-                        idx.0 += 525;
+                        idx.0 += 625;
                     }
                 }
-                idx.1 += 230;
+                idx.1 += 280;
                 idx.0 = 0;
             }
         }
