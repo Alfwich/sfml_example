@@ -5,8 +5,11 @@ use sfml::graphics::{Image};
 use core::ffi::c_void;
 use core::result::Result;
 use std::thread;
-use std::sync::{Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant};
+use std::sync::mpsc::{Sender, Receiver};
+use std::sync::mpsc;
+use std::collections::VecDeque;
 
 extern crate nalgebra_glm as glm;
 
@@ -23,25 +26,25 @@ struct Viewport {
 }
 
 #[derive(Debug)]
+struct DImageLoaded {
+    texture_id: u32,
+    container_idx: usize,
+}
+
+#[derive(Debug)]
 struct DImage {
-    pub loaded_failed: bool,
     pub scale: f32,
     pub border: f32,
     pub texture_id: u32,
-    pub texture_url: String,
 }
 
 #[derive(Debug)]
 struct DImageRow {
-    pub loaded_failed: bool,
     pub title: RenderedImage,
     
     pub images: Vec<DImage>,
     pub selected_tile_idx: f32,
     pub desired_selected_tile_idx: f32,
-    
-    refset_id: String,
-    refset_type: String,
 }
 
 #[derive(Debug)]
@@ -50,6 +53,43 @@ struct RenderedImage {
     width: u32,
     height: u32
 }
+
+fn load_image_from_disk(path: &str, width: i32, height: i32) -> Result<u32, String> {
+    let mut f = File::open(path).unwrap();
+    let mut img_bytes = Vec::new();
+    f.read_to_end(&mut img_bytes).unwrap();
+    
+    unsafe {
+        let mut id : u32 = 0;
+        gl::GenTextures(1, &mut id);
+        if id != 0 {
+            gl::BindTexture(gl::TEXTURE_2D, id);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE.try_into().unwrap());
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE.try_into().unwrap());
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR.try_into().unwrap());
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR.try_into().unwrap());
+            let img_data = Image::from_memory(&img_bytes);
+            match img_data {
+                Some(img_data) => {
+                    let img_data_ptr = img_data.pixel_data().as_ptr() as *const c_void;
+                    // RGBA since pixel_data pads to 4 channels
+                    gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA.try_into().unwrap(), width, height, 0, gl::RGBA, gl::UNSIGNED_BYTE, img_data_ptr);
+                    gl::GenerateMipmap(gl::TEXTURE_2D);
+                    gl::BindTexture(gl::TEXTURE_2D, 0);                
+                }
+                None => {
+                    gl::DeleteTextures(1, &id);
+                    println!("Bad Image for path: {:?}", path);
+                    return Err("Bad Image".to_string());
+                }
+            }
+
+        }
+        
+        return Ok(id);
+    }
+}
+
 
 fn load_image_from_url(client: &reqwest::blocking::Client, url: &str) -> Result<u32, String> {
     match client.get(url).send() {
@@ -323,123 +363,135 @@ fn render_text_to_texture(str: &str) -> RenderedImage {
 }
 
 // Loads initial page data and kicks off worker threads to finish image loading and refset loading
-fn load_page_data() {
-    static NUM_THREADS: i32 = 8;
+fn load_page_data(containers: &mut Vec<DImageRow>) -> Receiver<DImageLoaded> {
     static APP_DATA_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/home.json";
     static APP_DATA_REFSET_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/sets/{{id}}.json";
+    let (tx, rx): (Sender<DImageLoaded>, Receiver<DImageLoaded>) = mpsc::channel();
     
-    unsafe {
-        let resp = reqwest::blocking::get(APP_DATA_SOURCE).unwrap().text().unwrap();
-        let data: serde_json::Value = serde_json::from_str(&resp).unwrap();
-        let containers: Vec<serde_json::Value> = data["data"]["StandardCollection"]["containers"].as_array().unwrap().to_vec();
-        for container in containers {
-            let title = render_text_to_texture(&get_container_title_from_json_value(&container));
-            let refset_id = get_container_refset_id_from_json_value(&container);
-            let refset_type = get_container_refset_type_from_json_value(&container);
-            //println!("Found container with title: {:?}, refset_id: {:?}, refset_type: {:?}", title, refset_id, refset_type);
-            CONTAINERS.push(DImageRow {images: Vec::new(), title: title, refset_id: refset_id, refset_type: refset_type, selected_tile_idx: 0., desired_selected_tile_idx: 0., loaded_failed: false});
-            let items = container["set"]["items"].as_array();
-            match items {
-                Some(arr) => {
-                    for item in arr.to_vec() {
-                        let url = get_item_image_url_from_json_value(&item);
-                        CONTAINERS[CONTAINERS.len() - 1].images.push( DImage { texture_url: url.to_string(), texture_id: 0, scale: 1., border: 0., loaded_failed: false } );
-                    }
-                },
-                _ => {}
-            }
+    #[derive(Debug)]
+    struct ImageLoadingBundle {
+        pub refset_id: String,
+        pub refset_type: String,
+        pub container_idx: usize,
+        pub images_to_load: Vec<String>
+    }
+    
+    let rows_to_load: std::sync::Arc<std::sync::Mutex<VecDeque<ImageLoadingBundle>>> = Arc::new(Mutex::new(VecDeque::new()));
+    
+    let resp = reqwest::blocking::get(APP_DATA_SOURCE).unwrap().text().unwrap();
+    let data: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let json_containers: Vec<serde_json::Value> = data["data"]["StandardCollection"]["containers"].as_array().unwrap().to_vec();
+    let mut container_idx = 0;
+    for container in json_containers {
+        let title = render_text_to_texture(&get_container_title_from_json_value(&container));
+        let refset_id = get_container_refset_id_from_json_value(&container);
+        let refset_type = get_container_refset_type_from_json_value(&container);
+        
+        let mut bundle = ImageLoadingBundle {
+            refset_id,
+            refset_type,
+            container_idx,
+            images_to_load: Vec::new()
+        };
+        
+        container_idx += 1;
+        containers.push(DImageRow {images: Vec::new(), title: title, selected_tile_idx: 0., desired_selected_tile_idx: 0. });
+        let items = container["set"]["items"].as_array();
+        match items {
+            Some(arr) => {
+                for item in arr.to_vec() {
+                    let url = get_item_image_url_from_json_value(&item);
+                    bundle.images_to_load.push(url);
+                }
+            },
+            _ => {}
         }
         
-        lazy_static::lazy_static! {
-            static ref NEXT_IDS_LOCK: Mutex<i32> = Mutex::new(0i32);
-        }
-        static mut NEXT_IDX: usize = 0;
-        
-        // Spawn threads to acquire images and populate refsets
-        for _thread_idx in 0..NUM_THREADS {
-            thread::spawn(|| {
-                let client = reqwest::blocking::Client::new();
+        rows_to_load.lock().unwrap().push_back(bundle);
+    }
+    
+    // Spawn threads to acquire images and populate refsets
+    for _thread_idx in 0..4 {
+        let thread_tx = tx.clone();
+        let thread_rows_to_load = Arc::clone(&rows_to_load);
+        thread::spawn(move || {
+            loop {
                 // Create GL context to allow async threads to load image data
                 let _context = Context::new();
-                loop {
-                    let next;
-                    {
-                        NEXT_IDS_LOCK.lock().map_err(|err| println!("{:?}", err)).ok();
-                        next = NEXT_IDX;
-                        NEXT_IDX += 1;
-                    }
-                    
-                    if next >= CONTAINERS.len() {
+                let client = reqwest::blocking::Client::new();
+                let row_to_load = thread_rows_to_load.lock().unwrap().pop_front();
+                match row_to_load {
+                    Some(mut row_to_load) => {
+                        // Populate refset if needed
+                        if row_to_load.refset_id != "null" {
+                            let set_id = row_to_load.refset_id.to_string();
+                            let set_type = row_to_load.refset_type.to_string();
+                            let set_url = APP_DATA_REFSET_SOURCE.replace("{{id}}", &set_id);
+                            let ref_resp = reqwest::blocking::get(set_url).unwrap().text().unwrap();
+                            let ref_data: serde_json::Value = serde_json::from_str(&ref_resp).unwrap();
+                            
+                            let mut refset_data_key = set_type.to_string();
+                            for key in ref_data["data"].as_object().unwrap().keys() {
+                                refset_data_key = key.to_string();
+                                break;
+                            }
+                            
+                            let items = ref_data["data"][refset_data_key]["items"].as_array();
+                            match items {
+                                Some(arr) => {
+                                    for item in arr.to_vec() {
+                                        let url = get_item_image_url_from_json_value(&item);
+                                        row_to_load.images_to_load.push(url);
+                                    }
+                                },
+                                _ => {
+                                    println!("Failed to load refset id: {:?}, type: {:?}", set_id, set_type);
+                                }
+                            }
+                        }
+                        
+                        for image_url in &row_to_load.images_to_load {
+                            match load_image_from_url(&client, &image_url) {
+                                Ok(texture_id) => {
+                                    thread_tx.send(DImageLoaded { texture_id, container_idx: row_to_load.container_idx }).map_err(|err| println!("{:?}", err)).ok();
+                                },
+                                _ => {
+                                }
+                            }        
+                        }
+                    },
+                    _ => {
                         break;
                     }
-                    
-                    // Populate refset if needed
-                    if CONTAINERS[next].refset_id != "null" {
-                        let set_id = &CONTAINERS[next].refset_id;
-                        let set_type = &CONTAINERS[next].refset_type;
-                        let set_url = APP_DATA_REFSET_SOURCE.replace("{{id}}", set_id);
-                        //println!("Loading refset: {:?}, url: {:?}", CONTAINERS[next].refset_id, set_url);
-                        let ref_resp = reqwest::blocking::get(set_url).unwrap().text().unwrap();
-                        let ref_data: serde_json::Value = serde_json::from_str(&ref_resp).unwrap();
-                        
-                        let mut refset_data_key = set_type;
-                        for key in ref_data["data"].as_object().unwrap().keys() {
-                            refset_data_key = key;
-                            break;
-                        }
-                        
-                        let items = ref_data["data"][refset_data_key]["items"].as_array();
-                        match items {
-                            Some(arr) => {
-                                for item in arr.to_vec() {
-                                    let url = get_item_image_url_from_json_value(&item);
-                                    CONTAINERS[next].images.push( DImage { texture_url: url.to_string(), texture_id: 0, scale: 1., border:0., loaded_failed: false } );
-                                }
-                            },
-                            _ => {
-                                CONTAINERS[next].loaded_failed = true;
-                                println!("Failed to load refset id: {:?}, type: {:?}", set_id, set_type);
-                            }
-                        }
-                    }
-                    
-                    for image_idx in 0..CONTAINERS[next].images.len() {
-                        match load_image_from_url(&client, &CONTAINERS[next].images[image_idx].texture_url) {
-                            Ok(texture_id) => {
-                                CONTAINERS[next].images[image_idx].texture_id = texture_id;
-                            },
-                            _ => {
-                                CONTAINERS[next].images[image_idx].loaded_failed = true;
-                            }
-                        }        
-                    }
-                }
-            });
-        }
+                };
+            }
+        });
     }
+    
+    rx
 }
 
-static mut CONTAINERS: Vec<DImageRow> = Vec::new();
 
 fn main() {
     static WINDOW_SIZE: (u32, u32) = (1920, 1080);
-    static APP_FPS: u32 = 165;
+    let mut containers: Vec<DImageRow> = Vec::new();
     
     // Creates GL context internally
     let mut window = Window::new(WINDOW_SIZE, "SFML Example", Style::CLOSE, &Default::default());
-    window.set_framerate_limit(APP_FPS);
+    window.set_framerate_limit(200);
     
     // Init GL after GL context has been created
     gl_loader::init_gl();
     gl::load_with(|s| gl_loader::get_proc_address(s) as *const _);
     
-    load_page_data();
+    let loader_rx = load_page_data(&mut containers);
     
     let vao = gen_vertex_buffer();
     let vbo = gen_buffer();
     let ebo = gen_buffer();
     let tile_program = create_and_link_program("vertex.glsl", "tile.glsl");
     let text_program = create_and_link_program("vertex.glsl", "text.glsl");
+    let background_image_texture_id = load_image_from_disk("background.png", 1440, 1070).unwrap();
     
     upload_buffer_data(vao, vbo, ebo);
     
@@ -466,7 +518,7 @@ fn main() {
     
     while window.is_open() {
         let current = Instant::now();
-        let dt = (current - last).as_millis() as f32 / 1000.;
+        let dt = (current - last).as_secs_f32();
         last = current;
         
         while let Some(event) = window.poll_event() {
@@ -477,18 +529,14 @@ fn main() {
                 Event::KeyPressed { code, .. } => {
                     match code {
                         Key::D => {
-                            unsafe { 
-                                if CONTAINERS[selected_container_idx].desired_selected_tile_idx < (CONTAINERS[selected_container_idx].images.len() - 1) as f32 {
-                                    CONTAINERS[selected_container_idx].desired_selected_tile_idx += 1.;
-                                }
-                            };
+                            if containers[selected_container_idx].desired_selected_tile_idx < (containers[selected_container_idx].images.len() - 1) as f32 {
+                                containers[selected_container_idx].desired_selected_tile_idx += 1.;
+                            }
                         },
                         Key::A => {
-                            unsafe { 
-                                if CONTAINERS[selected_container_idx].desired_selected_tile_idx > 0. {
-                                    CONTAINERS[selected_container_idx].desired_selected_tile_idx -= 1.;
-                                }
-                            };
+                            if containers[selected_container_idx].desired_selected_tile_idx > 0. {
+                                containers[selected_container_idx].desired_selected_tile_idx -= 1.;
+                            }
                         },
                         Key::W => {
                             if selected_container_idx >= 1 {
@@ -496,18 +544,26 @@ fn main() {
                             }
                         },
                         Key::S => {
-                            unsafe {
-                                if selected_container_idx < CONTAINERS.len() - 1 {
-                                    selected_container_idx += 1;
-                                }
+                            if selected_container_idx < containers.len() - 1 {
+                                selected_container_idx += 1;
                             }
                         },
                         _ => {}
                     }
                     
-                    //println!("KEY PRESSED: {:?}", code)
                 }
                 _ => {}
+            }
+        }
+        
+        loop {
+            match loader_rx.try_recv() {
+                Ok(image_loaded) => {
+                    containers[image_loaded.container_idx].images.push( DImage { texture_id: image_loaded.texture_id, scale: 1., border: 0. });
+                }
+                Err(_type) => {
+                    break;
+                }
             }
         }
         
@@ -524,12 +580,24 @@ fn main() {
             gl::BindVertexArray(vao);
             gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
             
-            let mut idx = (0, 0);
-            for container_idx in 0..CONTAINERS.len() {
-                if CONTAINERS[container_idx].loaded_failed {
-                    continue;
-                }
+            // Draw Background
+            { 
+                let scale = glm::make_vec3(&[WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32, 1.]);
+                let model = glm::scale(&id, &scale);
+                let mve = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2., WINDOW_SIZE.1 as f32 / 2., 0.]);
+                let view = glm::translate(&id, &mve);
+                let mvp = ortho * view * model;
                 
+                
+                gl::UseProgram(tile_program);
+                gl::UniformMatrix4fv(tile_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                gl::Uniform1f(tile_border_loc, 0.);
+                gl::BindTexture(gl::TEXTURE_2D, background_image_texture_id);
+                gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
+            }
+            
+            let mut idx = (0, 0);
+            for container_idx in 0..containers.len() {
                 { 
                     let scale = glm::make_vec3(&[1024., 256., 1.]);
                     let model = glm::scale(&id, &scale);
@@ -537,50 +605,44 @@ fn main() {
                     let view = glm::translate(&id, &mve);
                     let mvp = ortho * view * model;
                     
-                    CONTAINERS[container_idx].selected_tile_idx += ((CONTAINERS[container_idx].desired_selected_tile_idx - CONTAINERS[container_idx].selected_tile_idx) / 0.1) * dt;
+                    containers[container_idx].selected_tile_idx += ((containers[container_idx].desired_selected_tile_idx - containers[container_idx].selected_tile_idx) / 0.1) * dt;
                     
                     gl::UseProgram(text_program);
                     gl::UniformMatrix4fv(text_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                    gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].title.texture_id);
+                    gl::BindTexture(gl::TEXTURE_2D, containers[container_idx].title.texture_id);
                     gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
                     
                     idx.1 += 190;
                 }
                 
-                let selected_tile_idx_i32 = CONTAINERS[container_idx].desired_selected_tile_idx.round() as usize;
+                let selected_tile_idx_i32 = containers[container_idx].desired_selected_tile_idx.round() as usize;
                 
-                for image_idx in 0..CONTAINERS[container_idx].images.len() {
+                for image_idx in 0..containers[container_idx].images.len() {
                     if selected_tile_idx_i32 == image_idx && selected_container_idx == container_idx {
-                        CONTAINERS[container_idx].images[image_idx].border = 0.01;
-                        if CONTAINERS[container_idx].images[image_idx].scale < 1.15 {
-                            CONTAINERS[container_idx].images[image_idx].scale += 1. * dt;
+                        containers[container_idx].images[image_idx].border = 0.01;
+                        if containers[container_idx].images[image_idx].scale < 1.15 {
+                            containers[container_idx].images[image_idx].scale += 1. * dt;
                         }
-                    } else if CONTAINERS[container_idx].images[image_idx].scale > 1. {
-                        CONTAINERS[container_idx].images[image_idx].border = 0.;
-                        CONTAINERS[container_idx].images[image_idx].scale -= 1. * dt;
-                        if CONTAINERS[container_idx].images[image_idx].scale < 1. {
-                            CONTAINERS[container_idx].images[image_idx].scale = 1.;
+                    } else if containers[container_idx].images[image_idx].scale > 1. {
+                        containers[container_idx].images[image_idx].border = 0.;
+                        containers[container_idx].images[image_idx].scale -= 1. * dt;
+                        if containers[container_idx].images[image_idx].scale < 1. {
+                            containers[container_idx].images[image_idx].scale = 1.;
                         }
                     }
                     
                     {
-                        let scale = glm::make_vec3(&[500. * CONTAINERS[container_idx].images[image_idx].scale, 281. * CONTAINERS[container_idx].images[image_idx].scale, 1.0]);
+                        let scale = glm::make_vec3(&[500. * containers[container_idx].images[image_idx].scale, 281. * containers[container_idx].images[image_idx].scale, 1.0]);
                         let model = glm::scale(&id, &scale);
-                        let mve = base_move + glm::make_vec3(&[viewport.pos[0] + idx.0 as f32 - (CONTAINERS[container_idx].selected_tile_idx * 625.) as f32, viewport.pos[1] - idx.1 as f32, 0.]);
+                        let mve = base_move + glm::make_vec3(&[viewport.pos[0] + idx.0 as f32 - (containers[container_idx].selected_tile_idx * 625.) as f32, viewport.pos[1] - idx.1 as f32, 0.]);
                         let view = glm::translate(&id, &mve);
                         let mvp = ortho * view * model;
                         
                         gl::UseProgram(tile_program);
                         gl::UniformMatrix4fv(tile_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
                         // TODO: x, y border factors
-                        gl::Uniform1f(tile_border_loc, CONTAINERS[container_idx].images[image_idx].border);
-                        // Complete hack to make it look better
-                        if CONTAINERS[container_idx].images[image_idx].loaded_failed {
-                            let next_idx = (image_idx + 3) % CONTAINERS[container_idx].images.len();
-                            gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].images[next_idx].texture_id);
-                        } else {
-                            gl::BindTexture(gl::TEXTURE_2D, CONTAINERS[container_idx].images[image_idx].texture_id);
-                        }
+                        gl::Uniform1f(tile_border_loc, containers[container_idx].images[image_idx].border);
+                        gl::BindTexture(gl::TEXTURE_2D, containers[container_idx].images[image_idx].texture_id);
                         gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
                         idx.0 += 625;
                     }
@@ -599,13 +661,14 @@ fn main() {
         gl::DeleteVertexArrays(1, &vao);
         gl::DeleteProgram(tile_program);
         gl::DeleteProgram(text_program);
-        for container_idx in 0..CONTAINERS.len() {
-            gl::DeleteTextures(1, &CONTAINERS[container_idx].title.texture_id);
-            for image_idx in 0..CONTAINERS[container_idx].images.len() {
-                gl::DeleteTextures(1, &CONTAINERS[container_idx].images[image_idx].texture_id);
+        gl::DeleteTextures(1, &background_image_texture_id);
+        
+        for container_idx in 0..containers.len() {
+            gl::DeleteTextures(1, &containers[container_idx].title.texture_id);
+            for image_idx in 0..containers[container_idx].images.len() {
+                gl::DeleteTextures(1, &containers[container_idx].images[image_idx].texture_id);
             }
         }
-        CONTAINERS.clear();
     }
     
     gl_loader::end_gl();
