@@ -529,7 +529,7 @@ fn main() {
                 Event::KeyPressed { code, .. } => {
                     match code {
                         Key::D => {
-                            if containers[selected_container_idx].desired_selected_tile_idx < (containers[selected_container_idx].images.len() - 1) as f32 {
+                            if containers[selected_container_idx].images.len() > 0 && containers[selected_container_idx].desired_selected_tile_idx < (containers[selected_container_idx].images.len() - 1) as f32 {
                                 containers[selected_container_idx].desired_selected_tile_idx += 1.;
                             }
                         },
@@ -596,6 +596,9 @@ fn main() {
                 gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
             }
             
+            if containers[3].images.len() < 3 {
+                continue;
+            }
             let mut idx = (0, 0);
             for container_idx in 0..containers.len() {
                 { 
