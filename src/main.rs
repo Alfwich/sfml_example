@@ -26,6 +26,15 @@ struct Viewport {
     desired_pos: [f32; 2]
 }
 
+impl Default for Viewport {
+    fn default() -> Self {
+        Viewport {
+            pos: [0., 0.],
+            desired_pos: [0., 0.],
+        }
+    }
+}
+
 #[derive(Debug)]
 struct DImageLoaded {
     texture_id: u32,
@@ -46,6 +55,17 @@ struct DImageRow {
     pub images: Vec<DImage>,
     pub selected_tile_idx: f32,
     pub desired_selected_tile_idx: f32,
+}
+
+impl Drop for DImageRow {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteTextures(1, &self.title.texture_id);
+            for image in &self.images {
+                gl::DeleteTextures(1, &image.texture_id);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -412,7 +432,7 @@ fn render_text_to_texture(str: &str) -> RenderedImage {
 }
 
 // Loads initial page data and kicks off worker threads to finish image loading and refset loading
-fn load_page_data(containers: &mut Vec<DImageRow>) -> Receiver<DImageLoaded> {
+fn load_page_data(app: &mut App) -> Receiver<DImageLoaded> {
     static APP_DATA_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/home.json";
     static APP_DATA_REFSET_SOURCE: &str = "https://cd-static.bamgrid.com/dp-117731241344/sets/{{id}}.json";
     let (tx, rx): (Sender<DImageLoaded>, Receiver<DImageLoaded>) = mpsc::channel();
@@ -444,7 +464,7 @@ fn load_page_data(containers: &mut Vec<DImageRow>) -> Receiver<DImageLoaded> {
         };
         
         container_idx += 1;
-        containers.push(DImageRow {images: Vec::new(), title: title, selected_tile_idx: 0., desired_selected_tile_idx: 0. });
+        app.containers.push(DImageRow {images: Vec::new(), title: title, selected_tile_idx: 0., desired_selected_tile_idx: 0. });
         let items = container["set"]["items"].as_array();
         match items {
             Some(arr) => {
@@ -460,7 +480,7 @@ fn load_page_data(containers: &mut Vec<DImageRow>) -> Receiver<DImageLoaded> {
     }
     
     // Spawn threads to acquire images and populate refsets
-    for _thread_idx in 0..8 {
+    for _thread_idx in 0..(num_cpus::get()-1) {
         let thread_tx = tx.clone();
         let thread_rows_to_load = Arc::clone(&rows_to_load);
         thread::spawn(move || {
@@ -502,7 +522,10 @@ fn load_page_data(containers: &mut Vec<DImageRow>) -> Receiver<DImageLoaded> {
                         for image_url in &row_to_load.images_to_load {
                             match load_image_from_url(&client, &image_url) {
                                 Ok(texture_id) => {
-                                    thread_tx.send(DImageLoaded { texture_id, container_idx: row_to_load.container_idx }).map_err(|err| println!("{:?}", err)).ok();
+                                    match thread_tx.send(DImageLoaded { texture_id, container_idx: row_to_load.container_idx }) {
+                                        Err(_e) => { return; }
+                                        _ => {}
+                                    };
                                 },
                                 _ => {
                                 }
@@ -520,118 +543,189 @@ fn load_page_data(containers: &mut Vec<DImageRow>) -> Receiver<DImageLoaded> {
     rx
 }
 
+struct App {
+    // GL Constructs
+    vao: u32,
+    vbo: u32,
+    ebo: u32,
+    tile_program_id: u32,
+    tile_program_mvp_loc: i32,
+    tile_program_border_loc: i32,
+    text_program_id: u32,
+    text_program_mvp_loc: i32,
+    background_image_texture_id: u32,
+    
+    // App values
+    has_tiles_loaded: bool,
+    title_height: f32,
+    row_height: f32,
+    tile_width: f32,
+    pub selected_container_idx: usize,
+    pub containers: Vec<DImageRow>,
+    pub viewport: Viewport,
+}
 
-fn main() {
+impl Default for App {
+    fn default() -> Self {
+        unsafe {
+            // Init GL after GL context has been created
+            gl_loader::init_gl();
+            gl::load_with(|s| gl_loader::get_proc_address(s) as *const _);
+            
+            let vao = gen_vertex_buffer();
+            let vbo = gen_buffer();
+            let ebo = gen_buffer();
+            let tile_program_id = create_and_link_program("vertex.glsl", "tile.glsl");
+            let text_program_id = create_and_link_program("vertex.glsl", "text.glsl");
+            let background_image_texture_id = load_image_from_disk("background.png", 1440, 1070).unwrap();
+            
+            upload_buffer_data(vao, vbo, ebo);
+            
+            let mvp_name = "mvp\0".as_bytes();
+            let border_name = "border\0".as_bytes();
+            
+            let tile_program_mvp_loc = gl::GetUniformLocation(tile_program_id, mvp_name.as_ptr() as *const i8);
+            let tile_program_border_loc = gl::GetUniformLocation(tile_program_id, border_name.as_ptr() as *const i8);
+            let text_program_mvp_loc = gl::GetUniformLocation(text_program_id, mvp_name.as_ptr() as *const i8); 
+            
+            App {
+                vao,
+                vbo,
+                ebo,
+                tile_program_id,
+                tile_program_mvp_loc,
+                tile_program_border_loc,
+                text_program_id,
+                text_program_mvp_loc,
+                background_image_texture_id,
+                has_tiles_loaded: false,
+                title_height: 200.,
+                row_height: 280.,
+                tile_width: 625.,
+                selected_container_idx: 0,
+                containers: Vec::new(),
+                viewport: Viewport::default()
+            }
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        unsafe {
+            self.containers.clear();
+            gl::DeleteBuffers(1, &self.ebo);
+            gl::DeleteBuffers(1, &self.vbo);
+            gl::DeleteVertexArrays(1, &self.vao);
+            gl::DeleteProgram(self.tile_program_id);
+            gl::DeleteProgram(self.text_program_id);
+            gl::DeleteTextures(1, &self.background_image_texture_id);    
+            gl_loader::end_gl();
+        }
+    }
+}
+
+fn handle_window_events(app: &mut App, window: &mut Window) {
+    while let Some(event) = window.poll_event() {
+        match event {
+            Event::Closed => {
+                window.close();
+            },
+            Event::KeyPressed { code, .. } => {
+                let containers = &mut app.containers;
+                match code {
+                    Key::D => {
+                        if containers[app.selected_container_idx].images.len() > 0 && containers[app.selected_container_idx].desired_selected_tile_idx < (containers[app.selected_container_idx].images.len() - 1) as f32 {
+                            containers[app.selected_container_idx].desired_selected_tile_idx += 1.;
+                        }
+                    },
+                    Key::A => {
+                        if containers[app.selected_container_idx].desired_selected_tile_idx > 0. {
+                            containers[app.selected_container_idx].desired_selected_tile_idx -= 1.;
+                        }
+                    },
+                    Key::W => {
+                        if app.selected_container_idx >= 1 {
+                            app.selected_container_idx -= 1;
+                        }
+                    },
+                    Key::S => {
+                        if app.selected_container_idx < app.containers.len() - 1 {
+                            app.selected_container_idx += 1;
+                        }
+                    },
+                    _ => {}
+                }
+                
+            }
+            _ => {}
+        }
+    }
+    
+
+}
+
+fn process_tile_loads(app: &mut App, rx: &Receiver<DImageLoaded>) {
+    loop {
+        match rx.try_recv() {
+            Ok(image_loaded) => {
+                app.containers[image_loaded.container_idx].images.push( DImage { texture_id: image_loaded.texture_id, scale: 1., border: 0. });
+            }
+            Err(_type) => {
+                break;
+            }
+        }
+    }
+}
+
+fn update(app: &mut App, dt: f32) {
+    static TILE_ZOOM_FACTOR: f32 = 1.20;
+    app.viewport.desired_pos[1] = (app.title_height + app.row_height) * app.selected_container_idx as f32;
+    app.viewport.pos[1] += ((app.viewport.desired_pos[1] - app.viewport.pos[1]) / 0.1) * dt;
+    
+    if app.containers[1].images.len() > 3 {
+        app.has_tiles_loaded = true;
+    }
+    
+    for (c_idx, container) in app.containers.iter_mut().enumerate() {
+        container.selected_tile_idx += ((container.desired_selected_tile_idx - container.selected_tile_idx) / 0.1) * dt;
+        
+        let selected_tile_idx_i32 = container.desired_selected_tile_idx.round() as usize;
+        for (idx, tile) in container.images.iter_mut().enumerate() {
+            if c_idx == app.selected_container_idx && selected_tile_idx_i32 == idx {
+                tile.border = 0.01;
+                if tile.scale < TILE_ZOOM_FACTOR {
+                    tile.scale += 1. * dt;
+                    if tile.scale > TILE_ZOOM_FACTOR {
+                        tile.scale = TILE_ZOOM_FACTOR;
+                    }
+                }
+            } else {
+                tile.border = 0.;
+                if tile.scale > 1. {
+                    tile.scale -= 1. * dt;
+                    if tile.scale < 1. {
+                        tile.scale = 1.;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render(app: &App) {
     static WINDOW_SIZE: (u32, u32) = (1920, 1080);
-    let mut containers: Vec<DImageRow> = Vec::new();
-    
-    // Creates GL context internally
-    let mut window = Window::new(WINDOW_SIZE, "SFML Example", Style::CLOSE, &Default::default());
-    window.set_framerate_limit(200);
-    
-    // Init GL after GL context has been created
-    gl_loader::init_gl();
-    gl::load_with(|s| gl_loader::get_proc_address(s) as *const _);
-    
-    let loader_rx = load_page_data(&mut containers);
-    
-    let vao = gen_vertex_buffer();
-    let vbo = gen_buffer();
-    let ebo = gen_buffer();
-    let tile_program = create_and_link_program("vertex.glsl", "tile.glsl");
-    let text_program = create_and_link_program("vertex.glsl", "text.glsl");
-    let background_image_texture_id = load_image_from_disk("background.png", 1440, 1070).unwrap();
-    
-    upload_buffer_data(vao, vbo, ebo);
-    
     let ortho = glm::ortho(0.0f32, WINDOW_SIZE.0 as f32, 0., WINDOW_SIZE.1 as f32, -10., 100.);
     let id = glm::identity::<f32, 4>();
     let base_move = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2. - 550., WINDOW_SIZE.1 as f32 / 2. + 350., 0.0]);
     
-    let tile_mvp_loc; 
-    let tile_border_loc; 
-    let text_mvp_loc; 
-    
-    unsafe { 
-        let mvp_name = "mvp\0".as_bytes();
-        let border_name = "border\0".as_bytes();
-        
-        tile_mvp_loc = gl::GetUniformLocation(tile_program, mvp_name.as_ptr() as *const i8);
-        tile_border_loc = gl::GetUniformLocation(tile_program, border_name.as_ptr() as *const i8);
-        text_mvp_loc = gl::GetUniformLocation(text_program, mvp_name.as_ptr() as *const i8); 
-    }
-    
-    let mut viewport = Viewport { pos: [0., 0.], desired_pos: [0., 0.] };
-    let mut selected_container_idx = 0;
-    let mut last = Instant::now();
-    
-    while window.is_open() {
-        let current = Instant::now();
-        let dt = (current - last).as_secs_f32();
-        last = current;
-        
-        while let Some(event) = window.poll_event() {
-            match event {
-                Event::Closed => {
-                    window.close();
-                },
-                Event::KeyPressed { code, .. } => {
-                    match code {
-                        Key::D => {
-                            if containers[selected_container_idx].images.len() > 0 && containers[selected_container_idx].desired_selected_tile_idx < (containers[selected_container_idx].images.len() - 1) as f32 {
-                                containers[selected_container_idx].desired_selected_tile_idx += 1.;
-                            }
-                        },
-                        Key::A => {
-                            if containers[selected_container_idx].desired_selected_tile_idx > 0. {
-                                containers[selected_container_idx].desired_selected_tile_idx -= 1.;
-                            }
-                        },
-                        Key::W => {
-                            if selected_container_idx >= 1 {
-                                selected_container_idx -= 1;
-                            }
-                        },
-                        Key::S => {
-                            if selected_container_idx < containers.len() - 1 {
-                                selected_container_idx += 1;
-                            }
-                        },
-                        _ => {}
-                    }
-                    
-                }
-                _ => {}
-            }
-        }
-        
-        loop {
-            match loader_rx.try_recv() {
-                Ok(image_loaded) => {
-                    containers[image_loaded.container_idx].images.push( DImage { texture_id: image_loaded.texture_id, scale: 1., border: 0. });
-                }
-                Err(_type) => {
-                    break;
-                }
-            }
-        }
-        
-        viewport.desired_pos[1] = 480. * selected_container_idx as f32;
-        viewport.pos[1] += ((viewport.desired_pos[1] - viewport.pos[1]) / 0.1) * dt;
-        
-        window.set_active(true);
-        
-        if containers[1].images.len() < 3 {
-            continue;
-        }
-        
-        unsafe {
+    unsafe {
             gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
             gl::Enable(gl::BLEND); 
             gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
             gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
-            gl::BindVertexArray(vao);
-            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
+            gl::BindVertexArray(app.vao);
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, app.ebo);
             
             // Draw Background
             { 
@@ -641,91 +735,83 @@ fn main() {
                 let view = glm::translate(&id, &mve);
                 let mvp = ortho * view * model;
                 
-                
-                gl::UseProgram(tile_program);
-                gl::UniformMatrix4fv(tile_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                gl::Uniform1f(tile_border_loc, 0.);
-                gl::BindTexture(gl::TEXTURE_2D, background_image_texture_id);
+                gl::UseProgram(app.tile_program_id);
+                gl::UniformMatrix4fv(app.tile_program_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                gl::Uniform1f(app.tile_program_border_loc, 0.);
+                gl::BindTexture(gl::TEXTURE_2D, app.background_image_texture_id);
                 gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
             }
             
+            if !app.has_tiles_loaded {
+                return;
+            }
+            
             let mut idx = (0, 0);
-            for container_idx in 0..containers.len() {
+            for container in &app.containers {
                 { 
-                    let scale = glm::make_vec3(&[containers[container_idx].title.width as f32, containers[container_idx].title.height as f32, 1.]);
+                    let scale = glm::make_vec3(&[container.title.width as f32, container.title.height as f32, 1.]);
                     let model = glm::scale(&id, &scale);
-                    let mve = base_move + glm::make_vec3(&[viewport.pos[0] + (containers[container_idx].title.width as f32 / 2.) - 250., viewport.pos[1] - idx.1 as f32, 0.]);
+                    let mve = base_move + glm::make_vec3(&[app.viewport.pos[0] + (container.title.width as f32 / 2.) - 250., app.viewport.pos[1] - idx.1 as f32, 0.]);
                     let view = glm::translate(&id, &mve);
                     let mvp = ortho * view * model;
                     
-                    containers[container_idx].selected_tile_idx += ((containers[container_idx].desired_selected_tile_idx - containers[container_idx].selected_tile_idx) / 0.1) * dt;
-                    
-                    gl::UseProgram(text_program);
-                    gl::UniformMatrix4fv(text_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                    gl::BindTexture(gl::TEXTURE_2D, containers[container_idx].title.texture_id);
+                    gl::UseProgram(app.text_program_id);
+                    gl::UniformMatrix4fv(app.text_program_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                    gl::BindTexture(gl::TEXTURE_2D, container.title.texture_id);
                     gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
                     
-                    idx.1 += 200;
+                    idx.1 += app.title_height as u32;
                 }
                 
-                let selected_tile_idx_i32 = containers[container_idx].desired_selected_tile_idx.round() as usize;
                 
-                for image_idx in 0..containers[container_idx].images.len() {
-                    if selected_tile_idx_i32 == image_idx && selected_container_idx == container_idx {
-                        containers[container_idx].images[image_idx].border = 0.01;
-                        if containers[container_idx].images[image_idx].scale < 1.15 {
-                            containers[container_idx].images[image_idx].scale += 1. * dt;
-                            if containers[container_idx].images[image_idx].scale > 1.15 {
-                                containers[container_idx].images[image_idx].scale = 1.15;
-                            }
-                        }
-                    } else if containers[container_idx].images[image_idx].scale > 1. {
-                        containers[container_idx].images[image_idx].border = 0.;
-                        containers[container_idx].images[image_idx].scale -= 1. * dt;
-                        if containers[container_idx].images[image_idx].scale < 1. {
-                            containers[container_idx].images[image_idx].scale = 1.;
-                        }
-                    }
-                    
+                let row_x_offset = container.selected_tile_idx * app.tile_width;
+                for image in &container.images {
                     {
-                        let scale = glm::make_vec3(&[500. * containers[container_idx].images[image_idx].scale, 281. * containers[container_idx].images[image_idx].scale, 1.0]);
+                        let scale = glm::make_vec3(&[500. * image.scale, 281. * image.scale, 1.0]);
                         let model = glm::scale(&id, &scale);
-                        let mve = base_move + glm::make_vec3(&[viewport.pos[0] + idx.0 as f32 - (containers[container_idx].selected_tile_idx * 625.) as f32, viewport.pos[1] - idx.1 as f32, 0.]);
+                        let mve = base_move + glm::make_vec3(&[app.viewport.pos[0] + idx.0 as f32 - row_x_offset, app.viewport.pos[1] - idx.1 as f32, 0.]);
                         let view = glm::translate(&id, &mve);
                         let mvp = ortho * view * model;
                         
-                        gl::UseProgram(tile_program);
-                        gl::UniformMatrix4fv(tile_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                        // TODO: x, y border factors
-                        gl::Uniform1f(tile_border_loc, containers[container_idx].images[image_idx].border);
-                        gl::BindTexture(gl::TEXTURE_2D, containers[container_idx].images[image_idx].texture_id);
+                        gl::UseProgram(app.tile_program_id);
+                        gl::UniformMatrix4fv(app.tile_program_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                        gl::Uniform1f(app.tile_program_border_loc, image.border);
+                        gl::BindTexture(gl::TEXTURE_2D, image.texture_id);
                         gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
-                        idx.0 += 625;
+                        idx.0 += app.tile_width as u32;
                     }
                 }
-                idx.1 += 280;
+                idx.1 += app.row_height as u32;
                 idx.0 = 0;
             }
         }
+}
+
+fn main() {
+    static WINDOW_SIZE: (u32, u32) = (1920, 1080);
+    static WINDOW_FPS: u32 = 200;
+    
+    // Creates GL context internally
+    let mut window = Window::new(WINDOW_SIZE, "SFML Example", Style::CLOSE, &Default::default());
+    window.set_framerate_limit(WINDOW_FPS);
+    
+    let mut app = App::default();
+    let loader_rx = load_page_data(&mut app);
+    let mut last = Instant::now();
+    
+    while window.is_open() {
+        let current = Instant::now();
+        let dt = (current - last).as_secs_f32();
+        last = current;
+        
+        handle_window_events(&mut app, &mut window);
+        process_tile_loads(&mut app, &loader_rx);
+        update(&mut app, dt);
+        
+        window.set_active(true);
+        
+        render(&app);
         
         window.display();
     }
-    
-    unsafe {
-        gl::DeleteBuffers(1, &ebo);
-        gl::DeleteBuffers(1, &vbo);
-        gl::DeleteVertexArrays(1, &vao);
-        gl::DeleteProgram(tile_program);
-        gl::DeleteProgram(text_program);
-        gl::DeleteTextures(1, &background_image_texture_id);
-        
-        for container_idx in 0..containers.len() {
-            gl::DeleteTextures(1, &containers[container_idx].title.texture_id);
-            for image_idx in 0..containers[container_idx].images.len() {
-                gl::DeleteTextures(1, &containers[container_idx].images[image_idx].texture_id);
-            }
-        }
-    }
-    
-    gl_loader::end_gl();
 }
