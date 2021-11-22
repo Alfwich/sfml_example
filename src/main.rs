@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant};
 use std::sync::mpsc::{Sender, Receiver};
 use std::sync::mpsc;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use itertools::Itertools;
 
 extern crate nalgebra_glm as glm;
 
@@ -306,18 +307,45 @@ fn get_container_refset_type_from_json_value(container: &serde_json::Value) -> S
     }
 }
 
-fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), top: i32, dst: &mut [[u8; 1024]; 256], src: &[u8]) {
-    let y_offset = 128 - top as u32;
-    for x in 0..size.0 {
-        for y in y_offset..(size.1 + y_offset) {
-            dst[y as usize][(x + offset.0) as usize] = src[x as usize + (((y - y_offset) * size.0) as usize)];
+struct TextTextureData {
+    pub rows: HashMap<i32, Vec<u8>>,
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<u8>,
+}
+
+impl Default for TextTextureData {
+    fn default() -> Self {
+        TextTextureData {
+            rows: HashMap::new(),
+            width: 0,
+            height: 0,
+            data: Vec::new()
         }
     }
 }
 
-fn sw_render_text_to_buffer(str: &str) -> ([[u8; 1024]; 256], (u32, u32)){
-    let mut result = [[0u8; 1024]; 256];
-    
+
+fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), top: i32, dst: &mut TextTextureData, src: &[u8]) {
+    let y_offset = -top as i32;
+    for x in 0..size.0 {
+        let x_pos = (x + offset.0) as usize;
+        for y in 0..size.1 {
+            let y_dst_pos = (y as i32 + y_offset) as i32;
+            if !dst.rows.contains_key(&y_dst_pos) {
+                dst.rows.insert(y_dst_pos, Vec::new());
+            }
+            
+            while dst.rows[&y_dst_pos].len() <= x_pos {
+                dst.rows.get_mut(&y_dst_pos).unwrap().push(0);
+            }
+                
+            dst.rows.get_mut(&y_dst_pos).unwrap()[x_pos] = src[x as usize + ((y * size.0) as usize)];
+        }
+    }
+}
+
+fn sw_render_text_to_buffer(str: &str, data: &mut TextTextureData) {
     static FONT_FILE: &str = "GlacialIndifference-Bold.otf";
     let lib = freetype::Library::init().unwrap();
     let face = lib.new_face(FONT_FILE, 0).unwrap();
@@ -328,11 +356,32 @@ fn sw_render_text_to_buffer(str: &str) -> ([[u8; 1024]; 256], (u32, u32)){
         let glyph = face.glyph();
         let glyph_bitmap = glyph.bitmap();
         let bitmap_data = glyph_bitmap.buffer();
-        sw_blit_to_buffer(offset, (glyph_bitmap.width() as u32, glyph_bitmap.rows() as u32), glyph.bitmap_top(), &mut result, bitmap_data);
+        sw_blit_to_buffer(offset, (glyph_bitmap.width() as u32, glyph_bitmap.rows() as u32), glyph.bitmap_top(), data, bitmap_data);
         offset.0 += (glyph.advance().x / 64) as u32;
     }
     
-    (result, offset)
+    data.height = data.rows.len();
+    
+    let mut max_width = 0;
+    for (_k, v) in &data.rows {
+        if v.len() > max_width {
+            max_width = v.len();
+        }
+    }
+    data.width = max_width;
+    
+    for k in data.rows.keys().sorted() {
+        let row = data.rows.get(k).unwrap();
+        for j in 0..data.width {
+            if j >= row.len() {
+                data.data.push(0);
+            } else {
+                data.data.push(row[j]);
+            }
+        }
+    }
+    
+    assert!(data.data.len() == data.width * data.height, "data should be width * height");
 }
 
 fn render_text_to_texture(str: &str) -> RenderedImage {
@@ -347,17 +396,17 @@ fn render_text_to_texture(str: &str) -> RenderedImage {
         gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR.try_into().unwrap());
         gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
         
-        let texture_data = sw_render_text_to_buffer(str);
-        let texture_data_ptr = texture_data.0.as_ptr() as *const c_void;
-        
-        gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RED.try_into().unwrap(), 1024, 256, 0, gl::RED, gl::UNSIGNED_BYTE, texture_data_ptr);
+        let mut texture_data = TextTextureData::default();
+        sw_render_text_to_buffer(str, &mut texture_data);
+        let texture_data_ptr = texture_data.data.as_ptr() as *const c_void;
+        gl::TexImage2D(gl::TEXTURE_2D, 0, gl::RED.try_into().unwrap(), texture_data.width as i32, texture_data.height as i32, 0, gl::RED, gl::UNSIGNED_BYTE, texture_data_ptr);
         gl::GenerateMipmap(gl::TEXTURE_2D);
         gl::BindTexture(gl::TEXTURE_2D, 0);
     
         RenderedImage {
             texture_id: id,
-            width: texture_data.1.0,
-            height: texture_data.1.1
+            width: texture_data.width as u32,
+            height: texture_data.height as u32
         }
     }
 }
@@ -376,7 +425,7 @@ fn load_page_data(containers: &mut Vec<DImageRow>) -> Receiver<DImageLoaded> {
         pub images_to_load: Vec<String>
     }
     
-    let rows_to_load: std::sync::Arc<std::sync::Mutex<VecDeque<ImageLoadingBundle>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let rows_to_load: Arc<Mutex<VecDeque<ImageLoadingBundle>>> = Arc::new(Mutex::new(VecDeque::new()));
     
     let resp = reqwest::blocking::get(APP_DATA_SOURCE).unwrap().text().unwrap();
     let data: serde_json::Value = serde_json::from_str(&resp).unwrap();
@@ -411,7 +460,7 @@ fn load_page_data(containers: &mut Vec<DImageRow>) -> Receiver<DImageLoaded> {
     }
     
     // Spawn threads to acquire images and populate refsets
-    for _thread_idx in 0..4 {
+    for _thread_idx in 0..8 {
         let thread_tx = tx.clone();
         let thread_rows_to_load = Arc::clone(&rows_to_load);
         thread::spawn(move || {
@@ -567,10 +616,14 @@ fn main() {
             }
         }
         
-        viewport.desired_pos[1] = 470. * selected_container_idx as f32;
+        viewport.desired_pos[1] = 480. * selected_container_idx as f32;
         viewport.pos[1] += ((viewport.desired_pos[1] - viewport.pos[1]) / 0.1) * dt;
         
         window.set_active(true);
+        
+        if containers[1].images.len() < 3 {
+            continue;
+        }
         
         unsafe {
             gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
@@ -596,15 +649,12 @@ fn main() {
                 gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
             }
             
-            if containers[3].images.len() < 3 {
-                continue;
-            }
             let mut idx = (0, 0);
             for container_idx in 0..containers.len() {
                 { 
-                    let scale = glm::make_vec3(&[1024., 256., 1.]);
+                    let scale = glm::make_vec3(&[containers[container_idx].title.width as f32, containers[container_idx].title.height as f32, 1.]);
                     let model = glm::scale(&id, &scale);
-                    let mve = base_move + glm::make_vec3(&[viewport.pos[0] + 266., viewport.pos[1] - idx.1 as f32, 0.]);
+                    let mve = base_move + glm::make_vec3(&[viewport.pos[0] + (containers[container_idx].title.width as f32 / 2.) - 250., viewport.pos[1] - idx.1 as f32, 0.]);
                     let view = glm::translate(&id, &mve);
                     let mvp = ortho * view * model;
                     
@@ -615,7 +665,7 @@ fn main() {
                     gl::BindTexture(gl::TEXTURE_2D, containers[container_idx].title.texture_id);
                     gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
                     
-                    idx.1 += 190;
+                    idx.1 += 200;
                 }
                 
                 let selected_tile_idx_i32 = containers[container_idx].desired_selected_tile_idx.round() as usize;
@@ -625,6 +675,9 @@ fn main() {
                         containers[container_idx].images[image_idx].border = 0.01;
                         if containers[container_idx].images[image_idx].scale < 1.15 {
                             containers[container_idx].images[image_idx].scale += 1. * dt;
+                            if containers[container_idx].images[image_idx].scale > 1.15 {
+                                containers[container_idx].images[image_idx].scale = 1.15;
+                            }
                         }
                     } else if containers[container_idx].images[image_idx].scale > 1. {
                         containers[container_idx].images[image_idx].border = 0.;
