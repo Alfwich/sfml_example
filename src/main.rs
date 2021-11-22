@@ -104,7 +104,6 @@ fn load_image_from_disk(path: &str, width: i32, height: i32) -> Result<u32, Stri
                     return Err("Bad Image".to_string());
                 }
             }
-
         }
         
         return Ok(id);
@@ -263,23 +262,14 @@ fn upload_buffer_data(vao: u32, vbo: u32, ebo: u32) {
         1, 2, 3
     ];
     
-    // Bind VAO
     unsafe {
         gl::BindVertexArray(vao);
-    }
-    
-    // Load VBO
-    unsafe {
         gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
         gl::BufferData(gl::ARRAY_BUFFER, f32_size_mult(size_of_vertex as usize * vertex_data.len()), vertex_data.as_ptr() as *const c_void, gl::STATIC_DRAW);
         gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, size_of_vertex, 0 as *const c_void);
         gl::EnableVertexAttribArray(0);
         gl::VertexAttribPointer(1, 2, gl::FLOAT, gl::FALSE, size_of_vertex, size_of_vertex_pos as *const c_void);
         gl::EnableVertexAttribArray(1);
-    }
-    
-    // Load EBO
-    unsafe {
         gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, ebo);
         gl::BufferData(gl::ELEMENT_ARRAY_BUFFER, (std::mem::size_of::<i32>() * index_data.len()).try_into().unwrap(), index_data.as_ptr() as *const c_void, gl::STATIC_DRAW);
     }
@@ -346,6 +336,7 @@ impl Default for TextTextureData {
 }
 
 
+
 fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), top: i32, dst: &mut TextTextureData, src: &[u8]) {
     let y_offset = -top as i32;
     for x in 0..size.0 {
@@ -360,7 +351,9 @@ fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), top: i32, dst: &mut T
                 dst.rows.get_mut(&y_dst_pos).unwrap().push(0);
             }
                 
-            dst.rows.get_mut(&y_dst_pos).unwrap()[x_pos] = src[x as usize + ((y * size.0) as usize)];
+            let val = src[x as usize + ((y * size.0) as usize)] as i32;
+            let existing = dst.rows.get_mut(&y_dst_pos).unwrap()[x_pos] as i32;
+            dst.rows.get_mut(&y_dst_pos).unwrap()[x_pos] = clamp(val + existing, 0, 255) as u8;
         }
     }
 }
@@ -400,6 +393,7 @@ fn sw_render_text_to_buffer(str: &str, data: &mut TextTextureData) {
             }
         }
     }
+    data.rows.clear();
     
     assert!(data.data.len() == data.width * data.height, "data should be width * height");
 }
@@ -446,11 +440,11 @@ fn load_page_data(app: &mut App) -> Receiver<DImageLoaded> {
     }
     
     let rows_to_load: Arc<Mutex<VecDeque<ImageLoadingBundle>>> = Arc::new(Mutex::new(VecDeque::new()));
-    
     let resp = reqwest::blocking::get(APP_DATA_SOURCE).unwrap().text().unwrap();
     let data: serde_json::Value = serde_json::from_str(&resp).unwrap();
     let json_containers: Vec<serde_json::Value> = data["data"]["StandardCollection"]["containers"].as_array().unwrap().to_vec();
     let mut container_idx = 0;
+    
     for container in json_containers {
         let title = render_text_to_texture(&get_container_title_from_json_value(&container));
         let refset_id = get_container_refset_id_from_json_value(&container);
@@ -678,6 +672,16 @@ fn process_tile_loads(app: &mut App, rx: &Receiver<DImageLoaded>) {
     }
 }
 
+fn clamp<T: std::cmp::PartialOrd>(x: T, min: T, max: T) -> T {
+    if x < min {
+        min
+    } else if x > max {
+        max
+    } else {
+        x
+    }
+}
+
 fn update(app: &mut App, dt: f32) {
     static TILE_ZOOM_FACTOR: f32 = 1.20;
     app.viewport.desired_pos[1] = (app.title_height + app.row_height) * app.selected_container_idx as f32;
@@ -695,43 +699,36 @@ fn update(app: &mut App, dt: f32) {
             if c_idx == app.selected_container_idx && selected_tile_idx_i32 == idx {
                 tile.border = 0.01;
                 if tile.scale < TILE_ZOOM_FACTOR {
-                    tile.scale += 1. * dt;
-                    if tile.scale > TILE_ZOOM_FACTOR {
-                        tile.scale = TILE_ZOOM_FACTOR;
-                    }
+                    tile.scale = clamp(tile.scale + dt, 1., TILE_ZOOM_FACTOR);
                 }
             } else {
                 tile.border = 0.;
                 if tile.scale > 1. {
-                    tile.scale -= 1. * dt;
-                    if tile.scale < 1. {
-                        tile.scale = 1.;
-                    }
+                    tile.scale = clamp(tile.scale - dt, 1., TILE_ZOOM_FACTOR);
                 }
             }
         }
     }
 }
 
-fn render(app: &App) {
-    static WINDOW_SIZE: (u32, u32) = (1920, 1080);
-    let ortho = glm::ortho(0.0f32, WINDOW_SIZE.0 as f32, 0., WINDOW_SIZE.1 as f32, -10., 100.);
+fn render(app: &App, windows_size: &(u32, u32)) {
+    let ortho = glm::ortho(0.0f32, windows_size.0 as f32, 0., windows_size.1 as f32, -10., 100.);
     let id = glm::identity::<f32, 4>();
-    let base_move = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2. - 550., WINDOW_SIZE.1 as f32 / 2. + 350., 0.0]);
+    let base_move = glm::make_vec3(&[windows_size.0 as f32 / 2. - 550., windows_size.1 as f32 / 2. + 350., 0.0]);
     
     unsafe {
             gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
             gl::Enable(gl::BLEND); 
             gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
-            gl::Viewport(0, 0, WINDOW_SIZE.0.try_into().unwrap(), WINDOW_SIZE.1.try_into().unwrap());
+            gl::Viewport(0, 0, windows_size.0.try_into().unwrap(), windows_size.1.try_into().unwrap());
             gl::BindVertexArray(app.vao);
             gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, app.ebo);
             
             // Draw Background
             { 
-                let scale = glm::make_vec3(&[WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32, 1.]);
+                let scale = glm::make_vec3(&[windows_size.0 as f32, windows_size.1 as f32, 1.]);
                 let model = glm::scale(&id, &scale);
-                let mve = glm::make_vec3(&[WINDOW_SIZE.0 as f32 / 2., WINDOW_SIZE.1 as f32 / 2., 0.]);
+                let mve = glm::make_vec3(&[windows_size.0 as f32 / 2., windows_size.1 as f32 / 2., 0.]);
                 let view = glm::translate(&id, &mve);
                 let mvp = ortho * view * model;
                 
@@ -810,7 +807,7 @@ fn main() {
         
         window.set_active(true);
         
-        render(&app);
+        render(&app, &WINDOW_SIZE);
         
         window.display();
     }
