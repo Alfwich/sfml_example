@@ -110,7 +110,6 @@ fn load_image_from_disk(path: &str, width: i32, height: i32) -> Result<u32, Stri
     }
 }
 
-
 fn load_image_from_url(client: &reqwest::blocking::Client, url: &str) -> Result<u32, String> {
     match client.get(url).send() {
         Ok(response) => {
@@ -151,7 +150,6 @@ fn load_image_from_url(client: &reqwest::blocking::Client, url: &str) -> Result<
         }
     }
 }
-
 
 fn gen_buffer() -> u32 {
     unsafe {
@@ -276,7 +274,7 @@ fn upload_buffer_data(vao: u32, vbo: u32, ebo: u32) {
 }
 
 fn get_item_image_url_from_json_value(item: &serde_json::Value) -> String {
-    let mut url:String = "".to_string();
+    let url;
     if item["image"]["tile"]["1.78"]["series"]["default"]["url"].is_string() {
         url = item["image"]["tile"]["1.78"]["series"]["default"]["url"].to_string();
     } else if item["image"]["tile"]["1.78"]["program"]["default"]["url"].is_string() {
@@ -284,7 +282,8 @@ fn get_item_image_url_from_json_value(item: &serde_json::Value) -> String {
     } else if item["image"]["tile"]["1.78"]["default"]["default"]["url"].is_string() {
         url = item["image"]["tile"]["1.78"]["default"]["default"]["url"].to_string();
     } else {
-        println!("Failed to fish out image url: {:#?}", item["image"]["tile"]["1.78"]);
+        println!("Failed to fish out image url: {:?}", item["image"]["tile"]["1.78"]);
+        return "".to_string();
     }
     
     url[1..url.len()-1].to_string()
@@ -335,12 +334,10 @@ impl Default for TextTextureData {
     }
 }
 
-
-
-fn sw_blit_to_buffer(offset: (u32, u32), size: (u32, u32), top: i32, dst: &mut TextTextureData, src: &[u8]) {
-    let y_offset = -top as i32;
+fn sw_blit_to_buffer(offset: (i32, i32), size: (u32, u32), top: i32, dst: &mut TextTextureData, src: &[u8]) {
+    let y_offset = (-top + offset.1) as i32;
     for x in 0..size.0 {
-        let x_pos = (x + offset.0) as usize;
+        let x_pos = (x + offset.0 as u32) as usize;
         for y in 0..size.1 {
             let y_dst_pos = (y as i32 + y_offset) as i32;
             if !dst.rows.contains_key(&y_dst_pos) {
@@ -363,14 +360,15 @@ fn sw_render_text_to_buffer(str: &str, data: &mut TextTextureData) {
     let lib = freetype::Library::init().unwrap();
     let face = lib.new_face(FONT_FILE, 0).unwrap();
     face.set_char_size(80 * 32, 0, 100, 0).map_err(|err| println!("{:?}", err)).ok();
-    let mut offset = (0u32, 0u32);
+    let mut offset = (0i32, 0i32);
     for c in str.chars() {
         face.load_char(c as usize, freetype::face::LoadFlag::RENDER).map_err(|err| println!("{:?}", err)).ok();
         let glyph = face.glyph();
         let glyph_bitmap = glyph.bitmap();
         let bitmap_data = glyph_bitmap.buffer();
         sw_blit_to_buffer(offset, (glyph_bitmap.width() as u32, glyph_bitmap.rows() as u32), glyph.bitmap_top(), data, bitmap_data);
-        offset.0 += (glyph.advance().x / 64) as u32;
+        offset.0 += glyph.advance().x / 64;
+        offset.1 += glyph.advance().y / 64;
     }
     
     data.height = data.rows.len();
@@ -537,8 +535,7 @@ fn load_page_data(app: &mut App) -> Receiver<DImageLoaded> {
     rx
 }
 
-struct App {
-    // GL Constructs
+struct AppGL {
     vao: u32,
     vbo: u32,
     ebo: u32,
@@ -547,9 +544,59 @@ struct App {
     tile_program_border_loc: i32,
     text_program_id: u32,
     text_program_mvp_loc: i32,
+}
+
+impl Default for AppGL {
+    fn default() -> Self {
+        // Init GL after GL context has been created
+        gl_loader::init_gl();
+        gl::load_with(|s| gl_loader::get_proc_address(s) as *const _);
+        
+        unsafe {
+            let vao = gen_vertex_buffer();
+            let vbo = gen_buffer();
+            let ebo = gen_buffer();
+            let tile_program_id = create_and_link_program("vertex.glsl", "tile.glsl");
+            let text_program_id = create_and_link_program("vertex.glsl", "text.glsl");
+            upload_buffer_data(vao, vbo, ebo);
+            
+            let mvp_name = "mvp\0".as_bytes();
+            let border_name = "border\0".as_bytes();
+            
+            let tile_program_mvp_loc = gl::GetUniformLocation(tile_program_id, mvp_name.as_ptr() as *const i8);
+            let tile_program_border_loc = gl::GetUniformLocation(tile_program_id, border_name.as_ptr() as *const i8);
+            let text_program_mvp_loc = gl::GetUniformLocation(text_program_id, mvp_name.as_ptr() as *const i8); 
+        
+            AppGL {
+                vao,
+                vbo,
+                ebo,
+                tile_program_id,
+                tile_program_mvp_loc,
+                tile_program_border_loc,
+                text_program_id,
+                text_program_mvp_loc,
+            }
+        }
+    }
+}
+
+impl Drop for AppGL {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteBuffers(1, &self.ebo);
+            gl::DeleteBuffers(1, &self.vbo);
+            gl::DeleteVertexArrays(1, &self.vao);
+            gl::DeleteProgram(self.tile_program_id);
+            gl::DeleteProgram(self.text_program_id);
+            gl_loader::end_gl();
+        }
+    }
+}
+
+struct App {
+    gl: AppGL,
     background_image_texture_id: u32,
-    
-    // App values
     has_tiles_loaded: bool,
     title_height: f32,
     row_height: f32,
@@ -561,60 +608,27 @@ struct App {
 
 impl Default for App {
     fn default() -> Self {
-        unsafe {
-            // Init GL after GL context has been created
-            gl_loader::init_gl();
-            gl::load_with(|s| gl_loader::get_proc_address(s) as *const _);
-            
-            let vao = gen_vertex_buffer();
-            let vbo = gen_buffer();
-            let ebo = gen_buffer();
-            let tile_program_id = create_and_link_program("vertex.glsl", "tile.glsl");
-            let text_program_id = create_and_link_program("vertex.glsl", "text.glsl");
-            let background_image_texture_id = load_image_from_disk("background.png", 1440, 1070).unwrap();
-            
-            upload_buffer_data(vao, vbo, ebo);
-            
-            let mvp_name = "mvp\0".as_bytes();
-            let border_name = "border\0".as_bytes();
-            
-            let tile_program_mvp_loc = gl::GetUniformLocation(tile_program_id, mvp_name.as_ptr() as *const i8);
-            let tile_program_border_loc = gl::GetUniformLocation(tile_program_id, border_name.as_ptr() as *const i8);
-            let text_program_mvp_loc = gl::GetUniformLocation(text_program_id, mvp_name.as_ptr() as *const i8); 
-            
-            App {
-                vao,
-                vbo,
-                ebo,
-                tile_program_id,
-                tile_program_mvp_loc,
-                tile_program_border_loc,
-                text_program_id,
-                text_program_mvp_loc,
-                background_image_texture_id,
-                has_tiles_loaded: false,
-                title_height: 200.,
-                row_height: 280.,
-                tile_width: 625.,
-                selected_container_idx: 0,
-                containers: Vec::new(),
-                viewport: Viewport::default()
-            }
+        
+        App {
+            gl: AppGL::default(),
+            background_image_texture_id: load_image_from_disk("background.png", 1440, 1070).unwrap(),
+            has_tiles_loaded: false,
+            title_height: 200.,
+            row_height: 280.,
+            tile_width: 625.,
+            selected_container_idx: 0,
+            containers: Vec::new(),
+            viewport: Viewport::default()
         }
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.containers.clear();
+        
         unsafe {
-            self.containers.clear();
-            gl::DeleteBuffers(1, &self.ebo);
-            gl::DeleteBuffers(1, &self.vbo);
-            gl::DeleteVertexArrays(1, &self.vao);
-            gl::DeleteProgram(self.tile_program_id);
-            gl::DeleteProgram(self.text_program_id);
             gl::DeleteTextures(1, &self.background_image_texture_id);    
-            gl_loader::end_gl();
         }
     }
 }
@@ -721,8 +735,8 @@ fn render(app: &App, windows_size: &(u32, u32)) {
             gl::Enable(gl::BLEND); 
             gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
             gl::Viewport(0, 0, windows_size.0.try_into().unwrap(), windows_size.1.try_into().unwrap());
-            gl::BindVertexArray(app.vao);
-            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, app.ebo);
+            gl::BindVertexArray(app.gl.vao);
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, app.gl.ebo);
             
             // Draw Background
             { 
@@ -732,9 +746,9 @@ fn render(app: &App, windows_size: &(u32, u32)) {
                 let view = glm::translate(&id, &mve);
                 let mvp = ortho * view * model;
                 
-                gl::UseProgram(app.tile_program_id);
-                gl::UniformMatrix4fv(app.tile_program_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                gl::Uniform1f(app.tile_program_border_loc, 0.);
+                gl::UseProgram(app.gl.tile_program_id);
+                gl::UniformMatrix4fv(app.gl.tile_program_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                gl::Uniform1f(app.gl.tile_program_border_loc, 0.);
                 gl::BindTexture(gl::TEXTURE_2D, app.background_image_texture_id);
                 gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
             }
@@ -752,8 +766,8 @@ fn render(app: &App, windows_size: &(u32, u32)) {
                     let view = glm::translate(&id, &mve);
                     let mvp = ortho * view * model;
                     
-                    gl::UseProgram(app.text_program_id);
-                    gl::UniformMatrix4fv(app.text_program_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                    gl::UseProgram(app.gl.text_program_id);
+                    gl::UniformMatrix4fv(app.gl.text_program_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
                     gl::BindTexture(gl::TEXTURE_2D, container.title.texture_id);
                     gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
                     
@@ -770,9 +784,9 @@ fn render(app: &App, windows_size: &(u32, u32)) {
                         let view = glm::translate(&id, &mve);
                         let mvp = ortho * view * model;
                         
-                        gl::UseProgram(app.tile_program_id);
-                        gl::UniformMatrix4fv(app.tile_program_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
-                        gl::Uniform1f(app.tile_program_border_loc, image.border);
+                        gl::UseProgram(app.gl.tile_program_id);
+                        gl::UniformMatrix4fv(app.gl.tile_program_mvp_loc, 1, gl::FALSE, mvp.data.as_slice().as_ptr());
+                        gl::Uniform1f(app.gl.tile_program_border_loc, image.border);
                         gl::BindTexture(gl::TEXTURE_2D, image.texture_id);
                         gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, 0 as *const c_void);
                         idx.0 += app.tile_width as u32;
