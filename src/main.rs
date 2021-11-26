@@ -13,15 +13,11 @@ mod util;
 #[derive(Debug)]
 pub struct Viewport {
     pos: [f32; 2],
-    desired_pos: [f32; 2],
 }
 
 impl Default for Viewport {
     fn default() -> Self {
-        Viewport {
-            pos: [0., 0.],
-            desired_pos: [0., 0.],
-        }
+        Viewport { pos: [0., 0.] }
     }
 }
 
@@ -225,6 +221,14 @@ fn spawn_worker_thread_for_thread_rows(tx: &Sender<DImageLoaded>, rows_to_load: 
     });
 }
 
+#[derive(Copy, Clone)]
+pub struct Animation {
+    pub position: f32,
+    pub current_value: f32,
+    pub desired_value: f32,
+    pub update_fn: fn(&mut App, f32, f32),
+}
+
 pub struct App {
     gl: app_gl::AppGL,
     background_image_texture_id: u32,
@@ -233,6 +237,7 @@ pub struct App {
     row_height: f32,
     tile_width: f32,
     pub selected_container_idx: usize,
+    pub animations: Vec<Animation>,
     pub containers: Vec<DImageRow>,
     pub viewport: Viewport,
 }
@@ -248,6 +253,7 @@ impl Default for App {
             tile_width: 625.,
             selected_container_idx: 0,
             containers: Vec::new(),
+            animations: Vec::new(),
             viewport: Viewport::default(),
         }
     }
@@ -278,21 +284,60 @@ fn handle_window_events(app: &mut App, window: &mut Window) {
                                 < (containers[app.selected_container_idx].images.len() - 1) as f32
                         {
                             containers[app.selected_container_idx].desired_selected_tile_idx += 1.;
+
+                            let animation = Animation {
+                                position: 0.,
+                                current_value: containers[app.selected_container_idx].selected_tile_idx,
+                                desired_value: containers[app.selected_container_idx].desired_selected_tile_idx,
+                                update_fn: |app, _i, new| {
+                                    app.containers[app.selected_container_idx].selected_tile_idx = new;
+                                },
+                            };
+                            app.animations.push(animation);
                         }
                     }
                     Key::A => {
                         if containers[app.selected_container_idx].desired_selected_tile_idx > 0. {
                             containers[app.selected_container_idx].desired_selected_tile_idx -= 1.;
+
+                            let animation = Animation {
+                                position: 0.,
+                                current_value: containers[app.selected_container_idx].selected_tile_idx,
+                                desired_value: containers[app.selected_container_idx].desired_selected_tile_idx,
+                                update_fn: |app, _i, new| {
+                                    app.containers[app.selected_container_idx].selected_tile_idx = new;
+                                },
+                            };
+                            app.animations.push(animation);
                         }
                     }
                     Key::W => {
                         if app.selected_container_idx >= 1 {
                             app.selected_container_idx -= 1;
+                            let animation = Animation {
+                                position: 0.,
+                                current_value: app.viewport.pos[1],
+                                desired_value: (app.title_height + app.row_height) * app.selected_container_idx as f32,
+                                update_fn: |app, _i, new| {
+                                    app.viewport.pos[1] = new;
+                                },
+                            };
+                            app.animations.push(animation);
                         }
                     }
                     Key::S => {
                         if app.selected_container_idx < app.containers.len() - 1 {
                             app.selected_container_idx += 1;
+
+                            let animation = Animation {
+                                position: 0.,
+                                current_value: app.viewport.pos[1],
+                                desired_value: (app.title_height + app.row_height) * app.selected_container_idx as f32,
+                                update_fn: |app, _i, new| {
+                                    app.viewport.pos[1] = new;
+                                },
+                            };
+                            app.animations.push(animation);
                         }
                     }
                     _ => {}
@@ -320,17 +365,30 @@ fn process_tile_loads(app: &mut App, rx: &Receiver<DImageLoaded>) {
     }
 }
 
+fn tick_animations(app: &mut App, dt: f32) {
+    for animation in &mut app.animations {
+        animation.position = util::clamp(animation.position + dt, 0., 1.);
+    }
+
+    // TODO: Fix this clunky mess
+    for i in 0..app.animations.len() {
+        let animation = app.animations[i];
+        let new_position = (1. - animation.position) * animation.current_value + (animation.position) * animation.desired_value;
+        (animation.update_fn)(app, animation.position, new_position);
+    }
+
+    app.animations.retain(|e| e.position != 1.);
+}
+
 fn update(app: &mut App, dt: f32) {
     static TILE_ZOOM_FACTOR: f32 = 1.20;
-    app.viewport.desired_pos[1] = (app.title_height + app.row_height) * app.selected_container_idx as f32;
-    app.viewport.pos[1] += ((app.viewport.desired_pos[1] - app.viewport.pos[1]) / 0.1) * dt;
+    tick_animations(app, dt);
 
     if app.containers[1].images.len() > 3 {
         app.has_tiles_loaded = true;
     }
 
     for (c_idx, container) in app.containers.iter_mut().enumerate() {
-        container.selected_tile_idx += ((container.desired_selected_tile_idx - container.selected_tile_idx) / 0.1) * dt;
 
         let selected_tile_idx_i32 = container.desired_selected_tile_idx.round() as usize;
         for (idx, tile) in container.images.iter_mut().enumerate() {
