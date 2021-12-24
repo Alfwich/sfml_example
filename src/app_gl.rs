@@ -9,6 +9,8 @@ use gl::*;
 
 extern crate nalgebra_glm as glm;
 
+use std::convert::TryInto;
+
 pub struct AppGL {
     pub vao: u32,
     pub vbo: u32,

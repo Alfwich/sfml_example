@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 extern crate nalgebra_glm as glm;
+extern crate sfml;
 
 mod app_gl;
 mod util;
@@ -60,6 +61,7 @@ fn get_item_image_url_from_json_value(item: &serde_json::Value) -> String {
     } else if item["image"]["tile"]["1.78"]["default"]["default"]["url"].is_string() {
         url = item["image"]["tile"]["1.78"]["default"]["default"]["url"].to_string();
     } else {
+        println!("Hello World! {}", 123);
         println!("Failed to fish out image url: {:?}", item["image"]["tile"]["1.78"]);
         return "".to_string();
     }
@@ -128,7 +130,7 @@ fn load_page_data(app: &mut App) -> Receiver<DImageLoaded> {
         container_idx += 1;
         app.containers.push(DImageRow {
             images: Vec::new(),
-            title: title,
+            title,
             selected_tile_idx: 0.,
             desired_selected_tile_idx: 0.,
         });
@@ -366,8 +368,9 @@ fn process_tile_loads(app: &mut App, rx: &Receiver<DImageLoaded>) {
 }
 
 fn tick_animations(app: &mut App, dt: f32) {
+    static ANIMATION_MULT: f32 = 6.;
     for animation in &mut app.animations {
-        animation.position = util::clamp(animation.position + dt, 0., 1.);
+        animation.position = util::clamp(animation.position + dt * ANIMATION_MULT, 0., 1.);
     }
 
     // TODO: Fix this clunky mess
